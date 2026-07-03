@@ -1,0 +1,6 @@
+/docs/
+.idea/
+.claude/
+*.exe
+/remote-shell-server
+/server
