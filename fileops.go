@@ -94,9 +94,10 @@ func looksBinary(data []byte) bool {
 	return false
 }
 
-// validatePath resolves path to an absolute cleaned path. When root is
-// non-empty, the resolved path must stay within root (sandbox).
-func validatePath(path string, root string) (string, error) {
+// validatePath resolves path to an absolute cleaned path. When roots is
+// non-empty, the resolved path must stay within at least one of the roots
+// (sandbox). An empty roots slice means no filesystem restriction.
+func validatePath(path string, roots []string) (string, error) {
 	if path == "" {
 		return "", errors.New("path is empty")
 	}
@@ -105,13 +106,16 @@ func validatePath(path string, root string) (string, error) {
 		return "", err
 	}
 	abs = filepath.Clean(abs)
-	if root != "" {
+	if len(roots) == 0 {
+		return abs, nil
+	}
+	for _, root := range roots {
 		cleanRoot := filepath.Clean(root)
-		if abs != cleanRoot && !strings.HasPrefix(abs, cleanRoot+string(os.PathSeparator)) {
-			return "", errors.New("path escapes allowed root")
+		if abs == cleanRoot || strings.HasPrefix(abs, cleanRoot+string(os.PathSeparator)) {
+			return abs, nil
 		}
 	}
-	return abs, nil
+	return "", errors.New("path escapes allowed roots")
 }
 
 // parseMode parses an octal mode string, defaulting to 0644 when empty.
@@ -144,8 +148,8 @@ type WriteFileResult struct {
 
 // WriteFileContent writes text content to a file, encoding it to the target
 // encoding, optionally appending and creating parent directories.
-func WriteFileContent(req WriteFileRequest, root string) (*WriteFileResult, error) {
-	abs, err := validatePath(req.Path, root)
+func WriteFileContent(req WriteFileRequest, roots []string) (*WriteFileResult, error) {
+	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -224,8 +228,8 @@ type ReadFileResult struct {
 
 // ReadFileContent reads a file, decodes it to UTF-8, and optionally slices
 // by 1-based line range. Binary files are reported without decoding.
-func ReadFileContent(req ReadFileRequest, root string) (*ReadFileResult, error) {
-	abs, err := validatePath(req.Path, root)
+func ReadFileContent(req ReadFileRequest, roots []string) (*ReadFileResult, error) {
+	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -311,8 +315,8 @@ type EditFileResult struct {
 
 // EditFileContent performs an exact string replacement in a file, preserving
 // the file's encoding and permissions.
-func EditFileContent(req EditFileRequest, root string) (*EditFileResult, error) {
-	abs, err := validatePath(req.Path, root)
+func EditFileContent(req EditFileRequest, roots []string) (*EditFileResult, error) {
+	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -389,8 +393,8 @@ type ListDirResult struct {
 }
 
 // ListDirectory lists the entries of a directory with basic metadata.
-func ListDirectory(path string, root string) (*ListDirResult, error) {
-	abs, err := validatePath(path, root)
+func ListDirectory(path string, roots []string) (*ListDirResult, error) {
+	abs, err := validatePath(path, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -435,8 +439,8 @@ type StatResult struct {
 
 // StatFile returns metadata about a path. A missing path yields
 // Exists:false without an error.
-func StatFile(path string, root string) (*StatResult, error) {
-	abs, err := validatePath(path, root)
+func StatFile(path string, roots []string) (*StatResult, error) {
+	abs, err := validatePath(path, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -486,8 +490,8 @@ type UploadBase64Result struct {
 
 // UploadBase64 decodes base64 content and writes it to a file, optionally
 // appending (for chunked uploads) and creating parent directories.
-func UploadBase64(req UploadBase64Request, root string) (*UploadBase64Result, error) {
-	abs, err := validatePath(req.Path, root)
+func UploadBase64(req UploadBase64Request, roots []string) (*UploadBase64Result, error) {
+	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -558,8 +562,8 @@ type DownloadBase64Result struct {
 
 // DownloadBase64 reads a byte range from a file starting at Offset and
 // returns it base64-encoded, supporting chunked downloads.
-func DownloadBase64(req DownloadBase64Request, root string) (*DownloadBase64Result, error) {
-	abs, err := validatePath(req.Path, root)
+func DownloadBase64(req DownloadBase64Request, roots []string) (*DownloadBase64Result, error) {
+	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
 	}

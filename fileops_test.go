@@ -61,31 +61,80 @@ func TestLooksBinary(t *testing.T) {
 
 func TestValidatePathSandbox(t *testing.T) {
 	root := t.TempDir()
+	roots := []string{root}
 
 	inside := filepath.Join(root, "sub", "file.txt")
-	if _, err := validatePath(inside, root); err != nil {
+	if _, err := validatePath(inside, roots); err != nil {
 		t.Errorf("path inside root rejected: %v", err)
 	}
 
 	// Sibling directory sharing a prefix must not bypass the sandbox.
 	bypass := root + "xxx/evil.txt"
-	if _, err := validatePath(bypass, root); err == nil {
+	if _, err := validatePath(bypass, roots); err == nil {
 		t.Error("prefix-bypass path was allowed")
 	}
 
 	// Traversal escaping root.
 	escape := filepath.Join(root, "..", "outside.txt")
-	if _, err := validatePath(escape, root); err == nil {
+	if _, err := validatePath(escape, roots); err == nil {
 		t.Error("traversal escape was allowed")
 	}
 
 	// No root => anything valid.
-	if _, err := validatePath("/etc/hosts", ""); err != nil {
+	if _, err := validatePath("/etc/hosts", nil); err != nil {
 		t.Errorf("no-root path rejected: %v", err)
 	}
 
-	if _, err := validatePath("", root); err == nil {
+	if _, err := validatePath("", roots); err == nil {
 		t.Error("empty path allowed")
+	}
+}
+
+func TestValidatePathMultipleRoots(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	roots := []string{rootA, rootB}
+
+	// A path under either root is allowed.
+	if _, err := validatePath(filepath.Join(rootA, "a.txt"), roots); err != nil {
+		t.Errorf("path under first root rejected: %v", err)
+	}
+	if _, err := validatePath(filepath.Join(rootB, "nested", "b.txt"), roots); err != nil {
+		t.Errorf("path under second root rejected: %v", err)
+	}
+
+	// The roots themselves are allowed.
+	if _, err := validatePath(rootB, roots); err != nil {
+		t.Errorf("root path itself rejected: %v", err)
+	}
+
+	// A path under neither root is rejected.
+	outside := filepath.Join(filepath.Dir(rootA), "outside-both")
+	if _, err := validatePath(outside, roots); err == nil {
+		t.Error("path outside all roots was allowed")
+	}
+}
+
+func TestToolBlacklist(t *testing.T) {
+	cfg := &Config{DisabledTools: map[string]bool{
+		"remote_execute":    true,
+		"remote_write_file": true,
+	}}
+
+	if cfg.toolEnabled("remote_execute") {
+		t.Error("blacklisted remote_execute reported as enabled")
+	}
+	if cfg.toolEnabled("remote_write_file") {
+		t.Error("blacklisted remote_write_file reported as enabled")
+	}
+	if !cfg.toolEnabled("remote_read_file") {
+		t.Error("non-blacklisted remote_read_file reported as disabled")
+	}
+
+	// A config with no blacklist enables everything.
+	empty := &Config{DisabledTools: map[string]bool{}}
+	if !empty.toolEnabled("remote_execute") {
+		t.Error("empty blacklist should enable all tools")
 	}
 }
 
@@ -98,7 +147,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		Content:  "第一行\n第二行\n第三行",
 		Encoding: "gbk",
 		MakeDirs: true,
-	}, root)
+	}, []string{root})
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -112,7 +161,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Error("file was not GBK-encoded on disk")
 	}
 
-	rd, err := ReadFileContent(ReadFileRequest{Path: target}, root)
+	rd, err := ReadFileContent(ReadFileRequest{Path: target}, []string{root})
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -124,7 +173,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 	}
 
 	// Line range slice.
-	slice, err := ReadFileContent(ReadFileRequest{Path: target, StartLine: 2, EndLine: 2}, root)
+	slice, err := ReadFileContent(ReadFileRequest{Path: target, StartLine: 2, EndLine: 2}, []string{root})
 	if err != nil {
 		t.Fatalf("read slice: %v", err)
 	}
@@ -137,10 +186,10 @@ func TestWriteAppend(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "log.txt")
 
-	if _, err := WriteFileContent(WriteFileRequest{Path: target, Content: "a"}, root); err != nil {
+	if _, err := WriteFileContent(WriteFileRequest{Path: target, Content: "a"}, []string{root}); err != nil {
 		t.Fatal(err)
 	}
-	wr, err := WriteFileContent(WriteFileRequest{Path: target, Content: "b", Append: true}, root)
+	wr, err := WriteFileContent(WriteFileRequest{Path: target, Content: "b", Append: true}, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,11 +208,11 @@ func TestEditFile(t *testing.T) {
 	os.WriteFile(target, []byte("foo bar foo baz"), 0644)
 
 	// Non-unique without replace_all => error.
-	if _, err := EditFileContent(EditFileRequest{Path: target, OldString: "foo", NewString: "X"}, root); err == nil {
+	if _, err := EditFileContent(EditFileRequest{Path: target, OldString: "foo", NewString: "X"}, []string{root}); err == nil {
 		t.Error("expected non-unique error")
 	}
 
-	res, err := EditFileContent(EditFileRequest{Path: target, OldString: "foo", NewString: "X", ReplaceAll: true}, root)
+	res, err := EditFileContent(EditFileRequest{Path: target, OldString: "foo", NewString: "X", ReplaceAll: true}, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +225,7 @@ func TestEditFile(t *testing.T) {
 	}
 
 	// Not found.
-	if _, err := EditFileContent(EditFileRequest{Path: target, OldString: "missing", NewString: "Y"}, root); err == nil {
+	if _, err := EditFileContent(EditFileRequest{Path: target, OldString: "missing", NewString: "Y"}, []string{root}); err == nil {
 		t.Error("expected not-found error")
 	}
 }
@@ -193,14 +242,14 @@ func TestBase64RoundTripChunked(t *testing.T) {
 	if _, err := UploadBase64(UploadBase64Request{
 		Path:    target,
 		DataB64: base64.StdEncoding.EncodeToString(original[:half]),
-	}, root); err != nil {
+	}, []string{root}); err != nil {
 		t.Fatalf("upload chunk1: %v", err)
 	}
 	if _, err := UploadBase64(UploadBase64Request{
 		Path:    target,
 		DataB64: base64.StdEncoding.EncodeToString(original[half:]),
 		Append:  true,
-	}, root); err != nil {
+	}, []string{root}); err != nil {
 		t.Fatalf("upload chunk2: %v", err)
 	}
 
@@ -213,7 +262,7 @@ func TestBase64RoundTripChunked(t *testing.T) {
 	var assembled []byte
 	var offset int64
 	for {
-		dl, err := DownloadBase64(DownloadBase64Request{Path: target, Offset: offset, MaxBytes: 4}, root)
+		dl, err := DownloadBase64(DownloadBase64Request{Path: target, Offset: offset, MaxBytes: 4}, []string{root})
 		if err != nil {
 			t.Fatalf("download: %v", err)
 		}
@@ -237,7 +286,7 @@ func TestReadBinaryDetection(t *testing.T) {
 	target := filepath.Join(root, "bin.dat")
 	os.WriteFile(target, []byte{0x00, 0x01, 0x02}, 0644)
 
-	rd, err := ReadFileContent(ReadFileRequest{Path: target}, root)
+	rd, err := ReadFileContent(ReadFileRequest{Path: target}, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +300,7 @@ func TestStatFile(t *testing.T) {
 	target := filepath.Join(root, "exists.txt")
 	os.WriteFile(target, []byte("hi"), 0644)
 
-	st, err := StatFile(target, root)
+	st, err := StatFile(target, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +308,7 @@ func TestStatFile(t *testing.T) {
 		t.Errorf("stat: %+v", st)
 	}
 
-	missing, err := StatFile(filepath.Join(root, "nope.txt"), root)
+	missing, err := StatFile(filepath.Join(root, "nope.txt"), []string{root})
 	if err != nil {
 		t.Fatalf("stat missing should not error: %v", err)
 	}
@@ -273,7 +322,7 @@ func TestListDirectory(t *testing.T) {
 	os.WriteFile(filepath.Join(root, "a.txt"), []byte("a"), 0644)
 	os.Mkdir(filepath.Join(root, "d"), 0755)
 
-	res, err := ListDirectory(root, root)
+	res, err := ListDirectory(root, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}

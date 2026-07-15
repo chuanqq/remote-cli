@@ -3,15 +3,17 @@ package main
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 // registerFileTools adds file operation tools to the MCP server. All tools
-// honor cfg.FSRoot as an optional sandbox and reuse the shared audit log.
+// honor cfg.FSRoots as an optional sandbox, respect the cfg tool blacklist,
+// and reuse the shared audit log.
 func registerFileTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
-	root := cfg.FSRoot
+	roots := cfg.FSRoots
 
 	// auditFileOp records a file operation in the shared audit log, reusing the
 	// AuditEntry shape (Command carries a synthetic "op path" descriptor).
@@ -20,25 +22,32 @@ func registerFileTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
 		if !ok {
 			exit = 1
 		}
+		workDir := ""
+		if len(roots) > 0 {
+			workDir = strings.Join(roots, ",")
+		}
 		audit.Log(AuditEntry{
 			SourceIP:         sourceIP(header),
 			Command:          op + " " + path,
-			WorkingDirectory: root,
+			WorkingDirectory: workDir,
 			ExitCode:         exit,
 			OutputBytes:      bytes,
 		})
 	}
 
-	registerWriteTool(s, root, auditFileOp)
-	registerReadTool(s, root, auditFileOp)
-	registerEditTool(s, root, auditFileOp)
-	registerListStatTools(s, root, auditFileOp)
-	registerBase64Tools(s, root, auditFileOp)
+	registerWriteTool(s, cfg, roots, auditFileOp)
+	registerReadTool(s, cfg, roots, auditFileOp)
+	registerEditTool(s, cfg, roots, auditFileOp)
+	registerListStatTools(s, cfg, roots, auditFileOp)
+	registerBase64Tools(s, cfg, roots, auditFileOp)
 }
 
 type fileAuditFunc func(header http.Header, op, path string, ok bool, bytes int)
 
-func registerWriteTool(s *server.MCPServer, root string, auditFileOp fileAuditFunc) {
+func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+	if !cfg.toolEnabled("remote_write_file") {
+		return
+	}
 	s.AddTool(mcp.NewTool("remote_write_file",
 		mcp.WithDescription("Write UTF-8 text content to a file on the remote server. Supports target encoding conversion (utf-8/gbk/gb2312/gb18030), append mode, and auto-creating parent directories. For binary data use remote_upload_base64."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute or relative file path on the remote server.")),
@@ -61,7 +70,7 @@ func registerWriteTool(s *server.MCPServer, root string, auditFileOp fileAuditFu
 			Append:   req.GetBool("append", false),
 			MakeDirs: req.GetBool("make_dirs", false),
 			Mode:     req.GetString("mode", ""),
-		}, root)
+		}, roots)
 		if err != nil {
 			auditFileOp(req.Header, "write_file", path, false, 0)
 			return mcp.NewToolResultError(err.Error()), nil
@@ -71,7 +80,10 @@ func registerWriteTool(s *server.MCPServer, root string, auditFileOp fileAuditFu
 	})
 }
 
-func registerReadTool(s *server.MCPServer, root string, auditFileOp fileAuditFunc) {
+func registerReadTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+	if !cfg.toolEnabled("remote_read_file") {
+		return
+	}
 	s.AddTool(mcp.NewTool("remote_read_file",
 		mcp.WithDescription("Read a file from the remote server and return its content as UTF-8. Auto-detects source encoding (utf-8/gbk) unless specified, supports 1-based line ranges, and detects binary files (use remote_download_base64 for those)."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute or relative file path on the remote server.")),
@@ -91,7 +103,7 @@ func registerReadTool(s *server.MCPServer, root string, auditFileOp fileAuditFun
 			StartLine: req.GetInt("start_line", 0),
 			EndLine:   req.GetInt("end_line", 0),
 			MaxBytes:  req.GetInt("max_bytes", 0),
-		}, root)
+		}, roots)
 		if err != nil {
 			auditFileOp(req.Header, "read_file", path, false, 0)
 			return mcp.NewToolResultError(err.Error()), nil
@@ -101,7 +113,10 @@ func registerReadTool(s *server.MCPServer, root string, auditFileOp fileAuditFun
 	})
 }
 
-func registerEditTool(s *server.MCPServer, root string, auditFileOp fileAuditFunc) {
+func registerEditTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+	if !cfg.toolEnabled("remote_edit_file") {
+		return
+	}
 	s.AddTool(mcp.NewTool("remote_edit_file",
 		mcp.WithDescription("Perform an exact string replacement in a remote file. old_string must match exactly; by default it must be unique (set replace_all to replace every occurrence). Preserves the file's encoding and permissions."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute or relative file path on the remote server.")),
@@ -125,7 +140,7 @@ func registerEditTool(s *server.MCPServer, root string, auditFileOp fileAuditFun
 			NewString:  req.GetString("new_string", ""),
 			ReplaceAll: req.GetBool("replace_all", false),
 			Encoding:   req.GetString("encoding", ""),
-		}, root)
+		}, roots)
 		if err != nil {
 			auditFileOp(req.Header, "edit_file", path, false, 0)
 			return mcp.NewToolResultError(err.Error()), nil
@@ -135,99 +150,107 @@ func registerEditTool(s *server.MCPServer, root string, auditFileOp fileAuditFun
 	})
 }
 
-func registerListStatTools(s *server.MCPServer, root string, auditFileOp fileAuditFunc) {
-	s.AddTool(mcp.NewTool("remote_list_dir",
-		mcp.WithDescription("List the entries of a directory on the remote server with name, type, size, mode, and modification time."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Directory path on the remote server.")),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		path := req.GetString("path", "")
-		if path == "" {
-			return mcp.NewToolResultError("path is required"), nil
-		}
+func registerListStatTools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+	if cfg.toolEnabled("remote_list_dir") {
+		s.AddTool(mcp.NewTool("remote_list_dir",
+			mcp.WithDescription("List the entries of a directory on the remote server with name, type, size, mode, and modification time."),
+			mcp.WithString("path", mcp.Required(), mcp.Description("Directory path on the remote server.")),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path := req.GetString("path", "")
+			if path == "" {
+				return mcp.NewToolResultError("path is required"), nil
+			}
 
-		result, err := ListDirectory(path, root)
-		if err != nil {
-			auditFileOp(req.Header, "list_dir", path, false, 0)
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		auditFileOp(req.Header, "list_dir", result.Path, true, result.Count)
-		return jsonResult(result), nil
-	})
+			result, err := ListDirectory(path, roots)
+			if err != nil {
+				auditFileOp(req.Header, "list_dir", path, false, 0)
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			auditFileOp(req.Header, "list_dir", result.Path, true, result.Count)
+			return jsonResult(result), nil
+		})
+	}
 
-	s.AddTool(mcp.NewTool("remote_stat",
-		mcp.WithDescription("Return metadata about a path on the remote server: existence, type, size, mode, modification time, and (for regular files) whether it looks binary. A missing path returns exists=false without error."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("File or directory path on the remote server.")),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		path := req.GetString("path", "")
-		if path == "" {
-			return mcp.NewToolResultError("path is required"), nil
-		}
+	if cfg.toolEnabled("remote_stat") {
+		s.AddTool(mcp.NewTool("remote_stat",
+			mcp.WithDescription("Return metadata about a path on the remote server: existence, type, size, mode, modification time, and (for regular files) whether it looks binary. A missing path returns exists=false without error."),
+			mcp.WithString("path", mcp.Required(), mcp.Description("File or directory path on the remote server.")),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path := req.GetString("path", "")
+			if path == "" {
+				return mcp.NewToolResultError("path is required"), nil
+			}
 
-		result, err := StatFile(path, root)
-		if err != nil {
-			auditFileOp(req.Header, "stat", path, false, 0)
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		auditFileOp(req.Header, "stat", result.Path, true, 0)
-		return jsonResult(result), nil
-	})
+			result, err := StatFile(path, roots)
+			if err != nil {
+				auditFileOp(req.Header, "stat", path, false, 0)
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			auditFileOp(req.Header, "stat", result.Path, true, 0)
+			return jsonResult(result), nil
+		})
+	}
 }
 
-func registerBase64Tools(s *server.MCPServer, root string, auditFileOp fileAuditFunc) {
-	s.AddTool(mcp.NewTool("remote_upload_base64",
-		mcp.WithDescription("Upload binary content to a remote file by decoding a base64 payload. Supports append mode for chunked uploads of large files and auto-creating parent directories."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Destination file path on the remote server.")),
-		mcp.WithString("data_b64", mcp.Required(), mcp.Description("Base64-encoded (standard encoding) file content or chunk.")),
-		mcp.WithBoolean("append", mcp.Description("Append this chunk instead of overwriting. Use for chunked uploads. Default false.")),
-		mcp.WithBoolean("make_dirs", mcp.Description("Create parent directories if missing. Default false.")),
-		mcp.WithString("mode", mcp.Description("Octal permission for newly created files, e.g. \"0644\". Default 0644.")),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		path := req.GetString("path", "")
-		if path == "" {
-			return mcp.NewToolResultError("path is required"), nil
-		}
-		dataB64 := req.GetString("data_b64", "")
-		if dataB64 == "" {
-			return mcp.NewToolResultError("data_b64 is required"), nil
-		}
+func registerBase64Tools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+	if cfg.toolEnabled("remote_upload_base64") {
+		s.AddTool(mcp.NewTool("remote_upload_base64",
+			mcp.WithDescription("Upload binary content to a remote file by decoding a base64 payload. Supports append mode for chunked uploads of large files and auto-creating parent directories."),
+			mcp.WithString("path", mcp.Required(), mcp.Description("Destination file path on the remote server.")),
+			mcp.WithString("data_b64", mcp.Required(), mcp.Description("Base64-encoded (standard encoding) file content or chunk.")),
+			mcp.WithBoolean("append", mcp.Description("Append this chunk instead of overwriting. Use for chunked uploads. Default false.")),
+			mcp.WithBoolean("make_dirs", mcp.Description("Create parent directories if missing. Default false.")),
+			mcp.WithString("mode", mcp.Description("Octal permission for newly created files, e.g. \"0644\". Default 0644.")),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path := req.GetString("path", "")
+			if path == "" {
+				return mcp.NewToolResultError("path is required"), nil
+			}
+			dataB64 := req.GetString("data_b64", "")
+			if dataB64 == "" {
+				return mcp.NewToolResultError("data_b64 is required"), nil
+			}
 
-		result, err := UploadBase64(UploadBase64Request{
-			Path:     path,
-			DataB64:  dataB64,
-			Append:   req.GetBool("append", false),
-			MakeDirs: req.GetBool("make_dirs", false),
-			Mode:     req.GetString("mode", ""),
-		}, root)
-		if err != nil {
-			auditFileOp(req.Header, "upload_base64", path, false, 0)
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		auditFileOp(req.Header, "upload_base64", result.Path, true, result.BytesWritten)
-		return jsonResult(result), nil
-	})
+			result, err := UploadBase64(UploadBase64Request{
+				Path:     path,
+				DataB64:  dataB64,
+				Append:   req.GetBool("append", false),
+				MakeDirs: req.GetBool("make_dirs", false),
+				Mode:     req.GetString("mode", ""),
+			}, roots)
+			if err != nil {
+				auditFileOp(req.Header, "upload_base64", path, false, 0)
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			auditFileOp(req.Header, "upload_base64", result.Path, true, result.BytesWritten)
+			return jsonResult(result), nil
+		})
+	}
 
-	s.AddTool(mcp.NewTool("remote_download_base64",
-		mcp.WithDescription("Download a byte range from a remote file as a base64 payload. Supports offset + max_bytes for chunked downloads of large or binary files; the eof flag signals the last chunk."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Source file path on the remote server.")),
-		mcp.WithNumber("offset", mcp.Description("Starting byte offset. Default 0.")),
-		mcp.WithNumber("max_bytes", mcp.Description("Maximum bytes to read this call. Default 4MB.")),
-	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		path := req.GetString("path", "")
-		if path == "" {
-			return mcp.NewToolResultError("path is required"), nil
-		}
+	if cfg.toolEnabled("remote_download_base64") {
+		s.AddTool(mcp.NewTool("remote_download_base64",
+			mcp.WithDescription("Download a byte range from a remote file as a base64 payload. Supports offset + max_bytes for chunked downloads of large or binary files; the eof flag signals the last chunk."),
+			mcp.WithString("path", mcp.Required(), mcp.Description("Source file path on the remote server.")),
+			mcp.WithNumber("offset", mcp.Description("Starting byte offset. Default 0.")),
+			mcp.WithNumber("max_bytes", mcp.Description("Maximum bytes to read this call. Default 4MB.")),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			path := req.GetString("path", "")
+			if path == "" {
+				return mcp.NewToolResultError("path is required"), nil
+			}
 
-		result, err := DownloadBase64(DownloadBase64Request{
-			Path:     path,
-			Offset:   int64(req.GetInt("offset", 0)),
-			MaxBytes: req.GetInt("max_bytes", 0),
-		}, root)
-		if err != nil {
-			auditFileOp(req.Header, "download_base64", path, false, 0)
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		auditFileOp(req.Header, "download_base64", result.Path, true, result.BytesRead)
-		return jsonResult(result), nil
-	})
+			result, err := DownloadBase64(DownloadBase64Request{
+				Path:     path,
+				Offset:   int64(req.GetInt("offset", 0)),
+				MaxBytes: req.GetInt("max_bytes", 0),
+			}, roots)
+			if err != nil {
+				auditFileOp(req.Header, "download_base64", path, false, 0)
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			auditFileOp(req.Header, "download_base64", result.Path, true, result.BytesRead)
+			return jsonResult(result), nil
+		})
+	}
 }
 
