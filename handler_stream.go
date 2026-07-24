@@ -89,6 +89,7 @@ func (h *StreamHandler) Handle(w http.ResponseWriter, r *http.Request) {
 
 	h.audit.Log(AuditEntry{
 		SourceIP:         r.RemoteAddr,
+		Tool:             "execute_stream",
 		Command:          req.Command,
 		WorkingDirectory: req.WorkingDirectory,
 		ExitCode:         exitCode,

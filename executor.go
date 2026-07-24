@@ -8,8 +8,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -67,7 +67,7 @@ func (e *Executor) Execute(req ExecuteRequest) *ExecResult {
 	defer e.running.Delete(id)
 
 	cmd := exec.Command(shell, "-c", req.Command)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcAttr(cmd)
 	if req.WorkingDirectory != "" {
 		cmd.Dir = req.WorkingDirectory
 	}
@@ -108,7 +108,7 @@ func (e *Executor) Execute(req ExecuteRequest) *ExecResult {
 	case err = <-waitCh:
 	case <-ctx.Done():
 		timedOut = ctx.Err() == context.DeadlineExceeded
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		killProcessGroup(cmd.Process.Pid)
 		err = <-waitCh
 	}
 
@@ -123,17 +123,18 @@ func (e *Executor) Execute(req ExecuteRequest) *ExecResult {
 		}
 	}
 
+	keepTail := strings.EqualFold(req.TruncateMode, "tail")
 	stdoutStr := stdout.String()
 	stderrStr := stderr.String()
 	stdoutTruncated := false
 	stderrTruncated := false
 
 	if len(stdoutStr) > maxOutput {
-		stdoutStr = stdoutStr[:maxOutput]
+		stdoutStr = truncateToLimit(stdoutStr, maxOutput, keepTail)
 		stdoutTruncated = true
 	}
 	if len(stderrStr) > maxOutput {
-		stderrStr = stderrStr[:maxOutput]
+		stderrStr = truncateToLimit(stderrStr, maxOutput, keepTail)
 		stderrTruncated = true
 	}
 
@@ -179,7 +180,7 @@ func (e *Executor) ExecuteStream(req ExecuteRequest, callback StreamCallback) {
 	defer e.running.Delete(id)
 
 	cmd := exec.Command(shell, "-c", req.Command)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcAttr(cmd)
 	if req.WorkingDirectory != "" {
 		cmd.Dir = req.WorkingDirectory
 	}
@@ -206,7 +207,7 @@ func (e *Executor) ExecuteStream(req ExecuteRequest, callback StreamCallback) {
 
 	go func() {
 		<-ctx.Done()
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		killProcessGroup(cmd.Process.Pid)
 	}()
 
 	var wg sync.WaitGroup
@@ -263,6 +264,28 @@ func (e *Executor) Cancel(id string) bool {
 		return true
 	}
 	return false
+}
+
+// truncateToLimit keeps the first (head) or last (tail) max bytes of s.
+// Cuts are nudged to a rune boundary so UTF-8 output stays printable.
+func truncateToLimit(s string, max int, tail bool) string {
+	if len(s) <= max {
+		return s
+	}
+	if !tail {
+		out := s[:max]
+		// Do not end mid-rune: back off to the last full rune.
+		for len(out) > 0 && !utf8.ValidString(out) {
+			out = out[:len(out)-1]
+		}
+		return out
+	}
+	out := s[len(s)-max:]
+	// Do not start mid-rune: drop the leading partial bytes.
+	for len(out) > 0 && !utf8.ValidString(out) {
+		out = out[1:]
+	}
+	return out
 }
 
 func (e *Executor) ExecuteInDir(shell, command, dir string, env []string, timeoutMs int) *ExecResult {

@@ -110,11 +110,14 @@ func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
 	h.audit.Log(AuditEntry{
 		RequestID:        result.ID,
 		SourceIP:         r.RemoteAddr,
+		Tool:             "session_execute",
+		SessionID:        sessionID,
 		Command:          req.Command,
 		WorkingDirectory: sess.WorkingDirectory,
 		ExitCode:         result.ExitCode,
 		DurationMs:       result.DurationMs,
 		OutputBytes:      len(result.Stdout) + len(result.Stderr),
+		Truncated:        result.StdoutTruncated || result.StderrTruncated,
 		TimedOut:         result.TimedOut,
 	})
 

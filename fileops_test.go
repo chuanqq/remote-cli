@@ -300,7 +300,7 @@ func TestStatFile(t *testing.T) {
 	target := filepath.Join(root, "exists.txt")
 	os.WriteFile(target, []byte("hi"), 0644)
 
-	st, err := StatFile(target, []string{root})
+	st, err := StatFile(StatRequest{Path: target}, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestStatFile(t *testing.T) {
 		t.Errorf("stat: %+v", st)
 	}
 
-	missing, err := StatFile(filepath.Join(root, "nope.txt"), []string{root})
+	missing, err := StatFile(StatRequest{Path: filepath.Join(root, "nope.txt")}, []string{root})
 	if err != nil {
 		t.Fatalf("stat missing should not error: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestListDirectory(t *testing.T) {
 	os.WriteFile(filepath.Join(root, "a.txt"), []byte("a"), 0644)
 	os.Mkdir(filepath.Join(root, "d"), 0755)
 
-	res, err := ListDirectory(root, []string{root})
+	res, err := ListDirectory(ListDirRequest{Path: root}, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}

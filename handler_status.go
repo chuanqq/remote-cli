@@ -35,7 +35,7 @@ func (h *StatusHandler) Handle(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, StatusResponse{
 		Status:         "healthy",
-		Version:        "1.0.0",
+		Version:        serverVersion,
 		UptimeSeconds:  int64(time.Since(h.startTime).Seconds()),
 		ActiveSessions: h.sessions.Count(),
 		System: SystemInfo{

@@ -4,6 +4,9 @@ import (
 	"time"
 )
 
+// serverVersion is reported by /api/status, remote_status and remote_get_env_info.
+const serverVersion = "1.1.0"
+
 type ExecuteRequest struct {
 	Command          string            `json:"command"`
 	WorkingDirectory string            `json:"working_directory,omitempty"`
@@ -11,6 +14,9 @@ type ExecuteRequest struct {
 	TimeoutMs        int               `json:"timeout_ms,omitempty"`
 	MaxOutputBytes   int               `json:"max_output_bytes,omitempty"`
 	Shell            string            `json:"shell,omitempty"`
+	// TruncateMode picks which end of an over-limit stdout/stderr to keep:
+	// "head" (default, first bytes) or "tail" (last bytes, better for logs).
+	TruncateMode     string            `json:"truncate_mode,omitempty"`
 }
 
 type ExecuteResponse struct {
@@ -78,10 +84,13 @@ type AuditEntry struct {
 	Timestamp        time.Time `json:"timestamp"`
 	RequestID        string    `json:"request_id"`
 	SourceIP         string    `json:"source_ip"`
+	Tool             string    `json:"tool,omitempty"`
+	SessionID        string    `json:"session_id,omitempty"`
 	Command          string    `json:"command"`
 	WorkingDirectory string    `json:"working_directory"`
 	ExitCode         int       `json:"exit_code"`
 	DurationMs       int64     `json:"duration_ms"`
 	OutputBytes      int       `json:"output_bytes"`
+	Truncated        bool      `json:"truncated,omitempty"`
 	TimedOut         bool      `json:"timed_out"`
 }

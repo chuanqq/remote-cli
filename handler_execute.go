@@ -42,11 +42,13 @@ func (h *ExecuteHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	h.audit.Log(AuditEntry{
 		RequestID:        result.ID,
 		SourceIP:         r.RemoteAddr,
+		Tool:             "execute",
 		Command:          req.Command,
 		WorkingDirectory: req.WorkingDirectory,
 		ExitCode:         result.ExitCode,
 		DurationMs:       result.DurationMs,
 		OutputBytes:      len(result.Stdout) + len(result.Stderr),
+		Truncated:        result.StdoutTruncated || result.StderrTruncated,
 		TimedOut:         result.TimedOut,
 	})
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -91,6 +92,22 @@ func (sm *SessionManager) Count() int {
 		return true
 	})
 	return count
+}
+
+// List returns live (non-expired) sessions ordered by creation time.
+func (sm *SessionManager) List() []*Session {
+	now := time.Now()
+	out := make([]*Session, 0)
+	sm.sessions.Range(func(_, value interface{}) bool {
+		sess := value.(*Session)
+		if now.After(sess.ExpiresAt) {
+			return true // expired: skipped (cleanupLoop reclaims it)
+		}
+		out = append(out, sess)
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
 }
 
 func (sm *SessionManager) UpdateWorkingDirectory(id, dir string) {
