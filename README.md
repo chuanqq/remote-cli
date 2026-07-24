@@ -1,22 +1,43 @@
-# Remote Shell API Server
+# remote-cli
 
-一个用 Go 编写的远程 Shell 执行与文件操作服务,同时提供 REST API 和 MCP(Streamable HTTP)两种接入方式,专为让 AI Agent(如 Claude Code)通过网络安全地管理远程主机而设计。
+[![Go Version](https://img.shields.io/github/go-mod/go-version/chuanqq/remote-cli)](https://go.dev/)
+[![Go Report Card](https://goreportcard.com/badge/github.com/chuanqq/remote-cli)](https://goreportcard.com/report/github.com/chuanqq/remote-cli)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-同一个进程、同一个端口同时承载 REST 与 MCP,共用 TLS 和 Bearer Token 鉴权。
+**English:** A single-binary remote shell & file-operations server written in Go, exposing both a REST API and an MCP (Streamable HTTP) endpoint on the same port — designed to let AI agents (such as Claude Code) securely operate remote hosts over the network, with 24 dedicated tools that cover search, log tailing, process/port inspection and file management without relying on shell commands.
+
+一个用 Go 编写的远程 Shell 执行与文件操作服务,同时提供 REST API 和 MCP(Streamable HTTP)两种接入方式,专为让 AI Agent(如 Claude Code)通过网络安全地管理远程主机而设计。内置 24 个专用工具,覆盖内容搜索、日志跟踪、进程/端口洞察与文件管理,绝大多数远程操作无需再拼 shell 命令。
+
+同一个进程、同一个端口同时承载 REST 与 MCP,共用 TLS 和 Bearer Token 鉴权;仅依赖少量三方库,编译产物为单二进制,零外部运行时依赖。
 
 ## 特性
 
-- **命令执行**:同步执行、SSE 流式输出、可取消,基于进程组(SIGKILL)的硬超时控制
-- **持久会话**:维护 cwd / shell / 环境变量,`cd` 后自动同步工作目录,带 TTL 自动回收
-- **文件操作**:读 / 写 / 编辑 / 列目录 / stat,支持 UTF-8 / GBK / GB2312 / GB18030 编码互转与自动探测,大文件支持 base64 分块上传下载
-- **MCP 接入**:`/mcp` 端点暴露 11 个工具,可直接接入 Claude Code、Cursor 等 MCP 客户端,支持按名单禁用工具
-- **安全控制**:Bearer Token 鉴权、按 IP 限流、输出字节上限、超时上限、可选多目录 `FSRoot` 文件系统沙箱、工具黑名单
-- **可观测**:结构化审计日志,记录每次命令与文件操作
+- **命令执行**:同步执行、SSE 流式输出、可取消,基于进程组(SIGKILL)的硬超时控制,输出截断可选保留头部或尾部(`truncate_mode`)
+- **持久会话**:维护 cwd / shell / 环境变量,`cd` 后自动同步工作目录,带 TTL 自动回收;REST 与 MCP 均可创建/列出/销毁会话
+- **文件操作**:读 / 写 / 编辑 / 列目录 / stat / 移动 / 复制 / 删除 / 建目录,支持 UTF-8 / GBK / GB2312 / GB18030 编码互转与自动探测,大文件支持 base64 分块上传下载;写入类操作返回 sha256/mode 自检,可选 bash/python 语法 lint
+- **内容搜索与日志**:服务端实现的内容正则搜索(`remote_search_content`)、文件名查找(`remote_find_files`)、大日志尾部/增量/跟随读取(`remote_tail_log`),不依赖目标机 grep/rg/find
+- **主机洞察**:进程枚举(`remote_list_processes`)、监听端口检查(`remote_check_port`)、一次性环境画像(`remote_get_env_info`)
+- **MCP 接入**:`/mcp` 端点暴露 24 个工具,可直接接入 Claude Code、Cursor 等 MCP 客户端,支持按名单禁用工具
+- **安全控制**:Bearer Token 鉴权、按 IP 限流、输出字节上限、超时上限、可选多目录 `FSRoot` 文件系统沙箱、工具黑名单、删除工具双重确认
+- **可观测**:结构化审计日志,记录每次命令与文件操作(含 tool 名、session、截断标记),并对 mysql 密码、Bearer token 等敏感信息自动脱敏
+
+## 平台支持
+
+| 平台 | 构建与测试 | `remote_list_processes` / `remote_check_port` | 其余工具 |
+| --- | --- | --- | --- |
+| Linux | ✅ | ✅ 完整实现(读 `/proc`) | ✅ |
+| macOS | ✅(本机构建,交叉编译受 cgo 限制) | ✅ 基于 `ps` / `lsof` 封装 | ✅ |
+| Windows | ✅ | ⚠️ 返回 unsupported | ✅ |
 
 ## 快速开始
 
 ```bash
-# 构建
+# 方式一:直接安装(需要 Go 1.23+)
+go install github.com/chuanqq/remote-cli@latest
+
+# 方式二:源码构建
+git clone https://github.com/chuanqq/remote-cli.git
+cd remote-cli
 go build -o remote-shell-server
 
 # 运行(最低要求:设置 Token)
@@ -99,12 +120,13 @@ MCP 端点位于 `/mcp`(Streamable HTTP),客户端配置示例:
 }
 ```
 
-暴露的工具:
+暴露的工具(共 24 个):
 
-- `remote_execute` / `remote_session_execute` / `remote_cancel` / `remote_status`
-- `remote_write_file` / `remote_read_file` / `remote_edit_file`
-- `remote_list_dir` / `remote_stat`
-- `remote_upload_base64` / `remote_download_base64`
+- 命令与会话:`remote_execute` / `remote_session_execute` / `remote_cancel` / `remote_status` / `remote_session_create` / `remote_session_list` / `remote_session_close`
+- 文件读写:`remote_write_file` / `remote_read_file` / `remote_edit_file` / `remote_list_dir` / `remote_stat` / `remote_upload_base64` / `remote_download_base64`
+- 搜索与日志:`remote_search_content` / `remote_find_files` / `remote_tail_log`
+- 文件管理:`remote_move_file` / `remote_copy_file` / `remote_delete_file` / `remote_make_dir`
+- 主机洞察:`remote_list_processes` / `remote_check_port` / `remote_get_env_info`
 
 ### 文件沙箱(FSRoot)
 
@@ -117,7 +139,8 @@ MCP 端点位于 `/mcp`(Streamable HTTP),客户端配置示例:
   ```
 
 - 留空则不做任何限制,文件操作可覆盖整台主机(与 shell 执行同等信任级别)。
-- **注意**:该沙箱只约束文件操作工具,不约束 `remote_execute` / `remote_session_execute`;shell 执行本身即完整权限,如需限制请配合工具黑名单。
+- **注意①**:该沙箱只约束文件操作工具,不约束 `remote_execute` / `remote_session_execute`;shell 执行本身即完整权限,如需限制请配合工具黑名单。
+- **注意②**:`remote_delete_file` 仅在设置了 `FSRoot` 时才会注册;删除动作还要求 `confirm: true`,支持 `dry_run` 预览,且拒绝删除 FS 根目录本身。
 
 ### 工具黑名单(DisabledTools)
 
@@ -129,7 +152,14 @@ SHELL_API_DISABLED_TOOLS=remote_execute,remote_session_execute,remote_cancel,rem
 ./remote-shell-server
 ```
 
-可禁用的工具名即上文列出的 11 个。
+可禁用的工具名即上文列出的 24 个。
+
+## 审计日志
+
+每次命令执行与文件操作都会输出一行 `[AUDIT]` JSON,字段:`timestamp / request_id / source_ip / tool / session_id / command / working_directory / exit_code / duration_ms / output_bytes / truncated / timed_out`。
+
+- `request_id` 缺失时自动生成(`audit-` 前缀),保证每条记录可关联
+- `command` 字段在落盘前自动脱敏:`mysql -p<密码>`、`Authorization: Bearer <token>`、`password= / token= / secret= / api_key=` 等形态替换为 `***`
 
 ## 安全须知
 
@@ -142,17 +172,27 @@ SHELL_API_DISABLED_TOOLS=remote_execute,remote_session_execute,remote_cancel,rem
 5. **不要暴露到公网**,应放在 VPN / 内网之后,或配合反向代理与额外鉴权
 6. 按 `AuditLogger` 输出的 `[AUDIT]` 日志做集中收集与审计
 
+如发现安全漏洞,请通过 GitHub Security Advisory 私下报告,不要直接开公开 Issue。
+
 ## 开发
 
 ```bash
-# 运行测试(覆盖文件操作与编码转换)
+# 运行全部测试(文件操作 / 搜索 / 日志 / 删除安全 / 脱敏 / 进程解析等)
 go test ./...
 
-# 跨平台编译(支持 Linux / macOS)
+# 跨平台编译
 GOOS=linux GOARCH=amd64 go build -o remote-shell-server
 ```
 
 仅依赖标准库加少量三方包(`google/uuid`、`mark3labs/mcp-go`、`golang.org/x/text`),无外部运行时依赖,单二进制部署。
+
+## 贡献
+
+欢迎 Issue 与 Pull Request。提交 PR 前请确保:
+
+- `go test ./...` 全部通过,新功能附带测试
+- `go vet ./...` 无告警,代码经 `gofmt` 格式化
+- 涉及新工具时同步更新本 README 的工具清单
 
 ## License
 

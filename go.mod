@@ -1,4 +1,4 @@
-module github.com/chuanqz/remote-cli/server
+module github.com/chuanqq/remote-cli
 
 go 1.23.11
 
