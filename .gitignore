@@ -5,5 +5,5 @@
 /CLAUDE.md
 /AGENTS.md
 *.exe
-/remote-shell-server
+/remote-agent-proxy
 /server

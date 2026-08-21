@@ -22,9 +22,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-BINARY="${SCRIPT_DIR}/remote-shell-server"
-PID_FILE="${SCRIPT_DIR}/remote-shell-server.pid"
-LOG_FILE="${SCRIPT_DIR}/remote-shell-server.log"
+BINARY="${SCRIPT_DIR}/remote-agent-proxy"
+PID_FILE="${SCRIPT_DIR}/remote-agent-proxy.pid"
+LOG_FILE="${SCRIPT_DIR}/remote-agent-proxy.log"
 
 # ──────────────────────────────────────────────
 # 环境变量默认值（可通过环境变量或 .env 覆盖）

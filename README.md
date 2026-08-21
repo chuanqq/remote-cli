@@ -39,16 +39,16 @@ go install github.com/chuanqq/remote-cli@latest
 # 方式二:源码构建
 git clone https://github.com/chuanqq/remote-cli.git
 cd remote-cli
-go build -o remote-shell-server
+go build -o remote-agent-proxy
 
 # 运行(最低要求:设置 Token)
-SHELL_API_TOKEN=your-secret-token ./remote-shell-server
+SHELL_API_TOKEN=your-secret-token ./remote-agent-proxy
 
 # 生产部署建议启用 TLS
 SHELL_API_TOKEN=your-secret-token \
 SHELL_API_TLS_CERT=./cert.pem \
 SHELL_API_TLS_KEY=./key.pem \
-./remote-shell-server
+./remote-agent-proxy
 ```
 
 接入 Claude Code:
@@ -382,7 +382,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 - 支持**多个目录前缀**,用逗号分隔;路径只要命中任意一个根目录即放行:
 
   ```bash
-  SHELL_API_FS_ROOT=/data/project,/tmp/workspace ./remote-shell-server
+  SHELL_API_FS_ROOT=/data/project,/tmp/workspace ./remote-agent-proxy
   ```
 
 - 留空则不做任何限制,文件操作可覆盖整台主机(与 shell 执行同等信任级别)。
@@ -396,7 +396,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 ```bash
 # 禁用命令执行与一切写操作,仅保留只读文件与状态查询
 SHELL_API_DISABLED_TOOLS=remote_execute,remote_session_execute,remote_cancel,remote_write_file,remote_edit_file,remote_upload_base64 \
-./remote-shell-server
+./remote-agent-proxy
 ```
 
 可禁用的工具名即上文列出的 24 个。
@@ -428,7 +428,7 @@ SHELL_API_DISABLED_TOOLS=remote_execute,remote_session_execute,remote_cancel,rem
 go test ./...
 
 # 跨平台编译
-GOOS=linux GOARCH=amd64 go build -o remote-shell-server
+GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy
 ```
 
 仅依赖标准库加少量三方包(`google/uuid`、`mark3labs/mcp-go`、`golang.org/x/text`),无外部运行时依赖,单二进制部署。
