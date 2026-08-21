@@ -6,4 +6,5 @@
 /AGENTS.md
 *.exe
 /remote-agent-proxy
+/dist/
 /server

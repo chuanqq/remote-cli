@@ -431,6 +431,24 @@ go test ./...
 GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy
 ```
 
+### 构建脚本
+
+`build.sh` 封装了多平台交叉编译,产物统一输出到 `dist/`(命名 `remote-agent-proxy-<版本>-<os>-<arch>`,版本号自动从 `types.go` 提取):
+
+```bash
+./build.sh                 # 构建当前平台
+./build.sh linux           # linux/amd64(只给 os 时 arch 默认 amd64)
+./build.sh linux/arm64     # 指定 os/arch
+./build.sh linux windows   # 一次构建多个目标
+./build.sh all             # 常用平台全套(linux/darwin/windows)
+./build.sh list            # 列出预设目标平台
+./build.sh --help          # 帮助
+```
+
+- linux / windows 目标以 `CGO_ENABLED=0` 静态编译,可在任意主机交叉编译,拷到低版本 glibc 机器(如 CentOS 7)也能直接跑。
+- darwin 目标依赖 cgo(`sysinfo_darwin.go`),只能在 macOS 主机构建;在非 macOS 主机会自动跳过。
+- 环境变量:`OUT_DIR` 改输出目录、`STRIP=0` 保留调试信息、`VERSION` 覆盖版本号。
+
 仅依赖标准库加少量三方包(`google/uuid`、`mark3labs/mcp-go`、`golang.org/x/text`),无外部运行时依赖,单二进制部署。
 
 ## 贡献
