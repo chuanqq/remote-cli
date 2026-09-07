@@ -235,7 +235,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `path` | string | * | 目录路径 |
-| `sort_by` | string | | `name`(默认,升序)/ `mtime`(最新在前)/ `size`(最大在前) |
+| `sort_by` | string | | `name`(默认,升序)/ `mtime`(最新在前)/ `size`(文件按大小降序在前,目录排在其后) |
 | `filter_glob` | array | | 只保留文件名匹配的条目,如 `["*.conf"]` |
 | `include_hidden` | boolean | | 包含点文件,默认 false |
 

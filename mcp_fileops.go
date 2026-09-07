@@ -198,7 +198,7 @@ func registerListStatTools(s *server.MCPServer, cfg *Config, roots []string, aud
 		s.AddTool(mcp.NewTool("remote_list_dir",
 			mcp.WithDescription("List directory entries on the remote server with name, type, size, mode, owner/group, mtime and symlink targets — the structured equivalent of `ls -la`. Supports glob filtering, hidden files, and sorting."),
 			mcp.WithString("path", mcp.Required(), mcp.Description("Directory path on the remote server.")),
-			mcp.WithString("sort_by", mcp.Description("Sort order: \"name\" (default, ascending), \"mtime\" (newest first), \"size\" (largest first)."), mcp.Enum("name", "mtime", "size")),
+			mcp.WithString("sort_by", mcp.Description("Sort order: \"name\" (default, ascending), \"mtime\" (newest first), \"size\" (files largest first, directories last — directory sizes are filesystem artifacts and are not compared)."), mcp.Enum("name", "mtime", "size")),
 			mcp.WithArray("filter_glob", mcp.Description("Keep only entries whose name matches any of these globs, e.g. [\"*.conf\"]."), mcp.WithStringItems()),
 			mcp.WithBoolean("include_hidden", mcp.Description("Include dot-files. Default false.")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

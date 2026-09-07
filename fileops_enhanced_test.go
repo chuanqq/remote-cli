@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -147,12 +149,56 @@ func TestListDirectoryEnhanced(t *testing.T) {
 	if res.Entries[0].Name != "a.txt" {
 		t.Errorf("size sort first=%s, want a.txt", res.Entries[0].Name)
 	}
+	// Full order: files by size descending, then directories. Directory st_size
+	// is filesystem-dependent (4096 on ext4, 64 on APFS) and must not take part
+	// in the comparison, otherwise dirs outrank real files.
+	var gotOrder []string
+	for _, e := range res.Entries {
+		gotOrder = append(gotOrder, e.Name)
+	}
+	wantOrder := []string{"a.txt", "b.conf", "sub"}
+	if !slices.Equal(gotOrder, wantOrder) {
+		t.Errorf("size sort order=%v, want %v", gotOrder, wantOrder)
+	}
 
 	// Entries carry type; on unix they also carry owner/group.
 	for _, e := range res.Entries {
 		if e.Type == "" {
 			t.Errorf("entry type empty: %+v", e)
 		}
+	}
+}
+
+// A directory whose st_size exceeds every file must still sort after the files.
+func TestListDirectorySizeSortIgnoresDirSize(t *testing.T) {
+	root := t.TempDir()
+	// Many children inflate the directory's own st_size on most filesystems.
+	sub := filepath.Join(root, "fat-dir")
+	if err := os.Mkdir(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		if err := os.WriteFile(filepath.Join(sub, fmt.Sprintf("child-%03d.txt", i)), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "small.txt"), []byte("ab"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := ListDirectory(ListDirRequest{Path: root, SortBy: "size"}, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Count != 2 {
+		t.Fatalf("count=%d, want 2", res.Count)
+	}
+	if res.Entries[0].Name != "small.txt" {
+		t.Errorf("first=%s (size %d), want small.txt; dir %s reported size %d",
+			res.Entries[0].Name, res.Entries[0].Size, res.Entries[1].Name, res.Entries[1].Size)
+	}
+	if !res.Entries[1].IsDir {
+		t.Errorf("last entry should be the directory, got %+v", res.Entries[1])
 	}
 }
 

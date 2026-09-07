@@ -635,7 +635,21 @@ func ListDirectory(req ListDirRequest, roots []string) (*ListDirResult, error) {
 	case "mtime":
 		sort.SliceStable(entries, func(i, j int) bool { return entries[i].ModTime > entries[j].ModTime })
 	case "size":
-		sort.SliceStable(entries, func(i, j int) bool { return entries[i].Size > entries[j].Size })
+		// Files first (largest first), directories after them in name order.
+		// A directory's st_size is a filesystem artifact — 4096 on ext4, 64 on
+		// APFS, none of it related to the contents — so comparing it against
+		// file sizes would let every directory outrank real files and defeat
+		// the purpose of this sort. Excluding dirs from the comparison also
+		// makes the order identical across platforms.
+		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].IsDir != entries[j].IsDir {
+				return !entries[i].IsDir
+			}
+			if entries[i].IsDir {
+				return false // both dirs: keep ReadDir's name order
+			}
+			return entries[i].Size > entries[j].Size
+		})
 	default: // name ascending
 		sort.SliceStable(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	}
