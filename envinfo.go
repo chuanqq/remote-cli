@@ -39,7 +39,10 @@ type ToolProbe struct {
 
 // ServerProfile is the operator-facing server configuration snapshot.
 type ServerProfile struct {
-	Version       string   `json:"version"`
+	Version string `json:"version"`
+	// ReadOnly reports read-only mode. When true every mutating tool is
+	// unregistered and mutating REST endpoints answer 403.
+	ReadOnly      bool     `json:"read_only"`
 	FSRoots       []string `json:"fs_roots,omitempty"`
 	DisabledTools []string `json:"disabled_tools,omitempty"`
 	MaxTimeoutSec int      `json:"max_timeout_sec"`
@@ -107,6 +110,7 @@ func GetEnvInfo(cfg *Config) *EnvInfoResult {
 		Tools:        probeTools(probeToolList),
 		Server: ServerProfile{
 			Version:       serverVersion,
+			ReadOnly:      cfg.ReadOnly,
 			FSRoots:       cfg.FSRoots,
 			DisabledTools: disabled,
 			MaxTimeoutSec: cfg.MaxTimeout,

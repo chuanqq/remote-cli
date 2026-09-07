@@ -41,6 +41,21 @@ type ExecResult struct {
 func (e *Executor) Execute(req ExecuteRequest) *ExecResult {
 	id := uuid.New().String()
 
+	// Layer-4 guard: shell execution is a write capability (a command can do
+	// anything), so it is refused outright under read-only mode.
+	if err := guardReadOnly("shell execution"); err != nil {
+		now := time.Now()
+		return &ExecResult{
+			ID:               id,
+			Command:          req.Command,
+			ExitCode:         -1,
+			Stderr:           err.Error(),
+			StartedAt:        now,
+			CompletedAt:      now,
+			WorkingDirectory: req.WorkingDirectory,
+		}
+	}
+
 	shell := req.Shell
 	if shell == "" {
 		shell = e.config.DefaultShell
@@ -158,6 +173,20 @@ type StreamCallback func(event StreamEvent)
 
 func (e *Executor) ExecuteStream(req ExecuteRequest, callback StreamCallback) {
 	id := uuid.New().String()
+
+	if err := guardReadOnly("shell execution (stream)"); err != nil {
+		callback(StreamEvent{
+			Type:      "error",
+			Line:      err.Error(),
+			Timestamp: time.Now().Format(time.RFC3339Nano),
+		})
+		callback(StreamEvent{
+			Type:      "exit",
+			ExitCode:  -1,
+			Timestamp: time.Now().Format(time.RFC3339Nano),
+		})
+		return
+	}
 
 	shell := req.Shell
 	if shell == "" {

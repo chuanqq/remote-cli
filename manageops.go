@@ -29,6 +29,9 @@ type MoveFileResult struct {
 // MoveFile renames/moves a file or directory. Falls back to copy+remove
 // across filesystem boundaries. Both paths are sandboxed by roots.
 func MoveFile(req MoveFileRequest, roots []string) (*MoveFileResult, error) {
+	if err := guardReadOnly("move_file"); err != nil {
+		return nil, err
+	}
 	srcAbs, err := validatePath(req.Src, roots)
 	if err != nil {
 		return nil, err
@@ -100,6 +103,9 @@ type CopyFileResult struct {
 // CopyFile copies a single file (preserving mode) or a directory tree.
 // An existing destination directory is an error (no implicit merging).
 func CopyFile(req CopyFileRequest, roots []string) (*CopyFileResult, error) {
+	if err := guardReadOnly("copy_file"); err != nil {
+		return nil, err
+	}
 	srcAbs, err := validatePath(req.Src, roots)
 	if err != nil {
 		return nil, err
@@ -238,6 +244,9 @@ const deleteSampleLimit = 100
 // confirm=true; dry_run returns the affected entries instead. As a blast
 // radius guard it also refuses to delete an FS root itself.
 func DeleteFile(req DeleteFileRequest, roots []string) (*DeleteFileResult, error) {
+	if err := guardReadOnly("delete_file"); err != nil {
+		return nil, err
+	}
 	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
@@ -321,6 +330,9 @@ type MakeDirResult struct {
 
 // MakeDir creates a directory, optionally with parents.
 func MakeDir(req MakeDirRequest, roots []string) (*MakeDirResult, error) {
+	if err := guardReadOnly("make_dir"); err != nil {
+		return nil, err
+	}
 	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err

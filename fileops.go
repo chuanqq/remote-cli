@@ -159,6 +159,9 @@ type WriteFileResult struct {
 // WriteFileContent writes text content to a file, encoding it to the target
 // encoding, optionally appending and creating parent directories.
 func WriteFileContent(req WriteFileRequest, roots []string) (*WriteFileResult, error) {
+	if err := guardReadOnly("write_file"); err != nil {
+		return nil, err
+	}
 	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
@@ -442,6 +445,11 @@ func previewString(s string, limit int) string {
 // first: any failure aborts the whole call without touching the file
 // (atomic multi-edit). DryRun reports the would-be changes without writing.
 func EditFileContent(req EditFileRequest, roots []string) (*EditFileResult, error) {
+	// Refused wholesale (even for dry_run): the tool is not registered under
+	// read-only mode, so reaching here means a caller bypassed registration.
+	if err := guardReadOnly("edit_file"); err != nil {
+		return nil, err
+	}
 	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
@@ -788,6 +796,9 @@ type UploadBase64Result struct {
 // UploadBase64 decodes base64 content and writes it to a file, optionally
 // appending (for chunked uploads) and creating parent directories.
 func UploadBase64(req UploadBase64Request, roots []string) (*UploadBase64Result, error) {
+	if err := guardReadOnly("upload_base64"); err != nil {
+		return nil, err
+	}
 	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err

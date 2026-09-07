@@ -38,6 +38,7 @@ func (h *StatusHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		Version:        serverVersion,
 		UptimeSeconds:  int64(time.Since(h.startTime).Seconds()),
 		ActiveSessions: h.sessions.Count(),
+		ReadOnly:       isReadOnly(),
 		System: SystemInfo{
 			Hostname:    hostname,
 			OS:          runtime.GOOS,

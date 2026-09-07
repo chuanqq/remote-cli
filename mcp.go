@@ -14,7 +14,24 @@ import (
 )
 
 func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLogger, cfg *Config) http.Handler {
-	s := server.NewMCPServer("remote-shell", serverVersion, server.WithToolCapabilities(true))
+	opts := []server.ServerOption{server.WithToolCapabilities(true)}
+	name := "remote-shell"
+	if cfg.ReadOnly {
+		// Announce the mode in the handshake so clients (and the agents driving
+		// them) know upfront that no write tool exists, instead of discovering
+		// it by a failed call.
+		name = "remote-shell-readonly"
+		opts = append(opts, server.WithInstructions(
+			"This server runs in READ-ONLY mode. Only inspection tools are available: "+
+				"file reads (remote_read_file, remote_list_dir, remote_stat, remote_search_content, "+
+				"remote_find_files, remote_tail_log, remote_download_base64) and host introspection "+
+				"(remote_list_processes, remote_check_port, remote_get_env_info, remote_status). "+
+				"Shell execution, sessions, and every write/edit/delete/move/copy/mkdir tool are "+
+				"disabled and cannot be re-enabled at runtime. Do not attempt to modify the host; "+
+				"if a change is required, report the exact command or diff for a human to apply.",
+		))
+	}
+	s := server.NewMCPServer(name, serverVersion, opts...)
 	startTime := time.Now()
 
 	registerFileTools(s, audit, cfg)
@@ -166,6 +183,7 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 				Version:        serverVersion,
 				UptimeSeconds:  int64(time.Since(startTime).Seconds()),
 				ActiveSessions: sessions.Count(),
+				ReadOnly:       cfg.ReadOnly,
 				System: SystemInfo{
 					Hostname:    hostname,
 					OS:          runtime.GOOS,

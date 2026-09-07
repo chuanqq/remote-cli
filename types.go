@@ -58,11 +58,13 @@ type SessionResponse struct {
 }
 
 type StatusResponse struct {
-	Status         string     `json:"status"`
-	Version        string     `json:"version"`
-	UptimeSeconds  int64      `json:"uptime_seconds"`
-	ActiveSessions int        `json:"active_sessions"`
-	System         SystemInfo `json:"system"`
+	Status         string `json:"status"`
+	Version        string `json:"version"`
+	UptimeSeconds  int64  `json:"uptime_seconds"`
+	ActiveSessions int    `json:"active_sessions"`
+	// ReadOnly reports whether the server refuses all mutating operations.
+	ReadOnly bool       `json:"read_only"`
+	System   SystemInfo `json:"system"`
 }
 
 type SystemInfo struct {

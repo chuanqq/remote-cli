@@ -24,6 +24,10 @@ type Config struct {
 	// DisabledTools names MCP tools that must NOT be registered at startup
 	// (e.g. "remote_execute"). A disabled tool is invisible to MCP clients.
 	DisabledTools map[string]bool
+	// ReadOnly, when true, forces the server into read-only mode: every
+	// mutating tool and REST endpoint is disabled regardless of any other
+	// setting. This flag has the HIGHEST priority — nothing overrides it.
+	ReadOnly bool
 }
 
 func LoadConfig() *Config {
@@ -55,11 +59,39 @@ func LoadConfig() *Config {
 		}
 	}
 
+	// SHELL_API_READONLY is applied LAST so it wins over every setting above:
+	// it force-disables all mutating tools and latches the process-wide guard.
+	cfg.applyReadOnly(readOnlyFromEnv())
+
 	return cfg
 }
 
+// applyReadOnly turns read-only mode on when enabled is true. It is idempotent
+// and one-way: calling it with false never clears a previously enabled state,
+// so read-only cannot be downgraded by a later config pass.
+func (c *Config) applyReadOnly(enabled bool) {
+	if !enabled {
+		return
+	}
+	c.ReadOnly = true
+	if c.DisabledTools == nil {
+		c.DisabledTools = make(map[string]bool)
+	}
+	// Fold the forced set into DisabledTools so remote_get_env_info and the
+	// startup log report the effective blacklist, not just the operator's.
+	for _, name := range readOnlyDisabledTools() {
+		c.DisabledTools[name] = true
+	}
+	enableReadOnly()
+}
+
 // toolEnabled reports whether the named MCP tool should be registered.
+// Read-only mode is checked FIRST and uses allowlist semantics: an unknown or
+// mutating tool is denied even if the operator did not blacklist it.
 func (c *Config) toolEnabled(name string) bool {
+	if c.ReadOnly && !readOnlyTools[name] {
+		return false
+	}
 	return !c.DisabledTools[name]
 }
 

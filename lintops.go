@@ -19,6 +19,12 @@ type LintResult struct {
 // LintFile runs a cheap syntax check on a freshly written file:
 // "bash" -> bash -n, "python" -> python3 -m py_compile.
 func LintFile(absPath, lang string) *LintResult {
+	// Linting spawns an interpreter with a caller-supplied path. It is only
+	// reachable from write/edit (both disabled under read-only mode); this
+	// guard keeps the process-spawn surface closed regardless.
+	if isReadOnly() {
+		return &LintResult{Lang: lang, Skipped: true, Output: "skipped: server is in read-only mode"}
+	}
 	switch strings.ToLower(strings.TrimSpace(lang)) {
 	case "bash", "sh":
 		return lintWith("bash", "bash", "-n", absPath)

@@ -19,6 +19,7 @@
 - **文件操作**:读 / 写 / 编辑 / 列目录 / stat / 移动 / 复制 / 删除 / 建目录,支持 UTF-8 / GBK / GB2312 / GB18030 编码互转与自动探测,大文件支持 base64 分块上传下载;写入类操作返回 sha256/mode 自检,可选 bash/python 语法 lint
 - **内容搜索与日志**:服务端实现的内容正则搜索、文件名查找、大日志尾部/增量/跟随读取,不依赖目标机 grep/rg/find
 - **主机洞察**:进程枚举、监听端口检查、一次性环境画像(36 个常用工具链探测)
+- **只读模式**:`SHELL_API_READONLY=true` 一键将服务降级为纯读取代理,四层强制、运行时不可恢复,优先级高于其他所有配置
 - **安全控制**:Bearer Token 鉴权、按 IP 限流、输出字节上限、超时上限、可选多目录 `FSRoot` 文件系统沙箱、工具黑名单、删除工具双重确认
 - **可观测**:结构化审计日志,记录每次调用(含 tool 名、session、截断标记),并对 mysql 密码、Bearer token 等敏感信息自动脱敏
 
@@ -43,6 +44,11 @@ go build -o remote-agent-proxy
 
 # 运行(最低要求:设置 Token)
 SHELL_API_TOKEN=your-secret-token ./remote-agent-proxy
+
+# 只读模式(一键):仅暴露读取能力,禁止任何修改
+SHELL_API_TOKEN=your-secret-token SHELL_API_READONLY=true ./remote-agent-proxy
+# 或用启动脚本
+./start.sh start-ro
 
 # 生产部署建议启用 TLS
 SHELL_API_TOKEN=your-secret-token \
@@ -79,6 +85,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
+| `SHELL_API_READONLY` | (空) | **只读模式开关,优先级最高**。取 `1` / `true` / `yes` / `on` / `enabled` 开启;开启后所有写能力强制关闭,无法被其他配置覆盖 |
 | `SHELL_API_PORT` | `8080` | 监听端口 |
 | `SHELL_API_TOKEN` | (必填) | Bearer Token,客户端鉴权凭据 |
 | `SHELL_API_TLS_CERT` | (空) | TLS 证书路径,留空则监听明文 HTTP |
@@ -92,13 +99,17 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 ## 工具一览(24 个)
 
-| 分组 | 工具 |
-| --- | --- |
-| 命令与会话 | `remote_execute` `remote_session_execute` `remote_cancel` `remote_status` `remote_session_create` `remote_session_list` `remote_session_close` |
-| 文件读写 | `remote_write_file` `remote_read_file` `remote_edit_file` `remote_list_dir` `remote_stat` `remote_upload_base64` `remote_download_base64` |
-| 搜索与日志 | `remote_search_content` `remote_find_files` `remote_tail_log` |
-| 文件管理 | `remote_move_file` `remote_copy_file` `remote_delete_file` `remote_make_dir` |
-| 主机洞察 | `remote_list_processes` `remote_check_port` `remote_get_env_info` |
+| 分组 | 工具 | 只读模式 |
+| --- | --- | --- |
+| 命令与会话 | `remote_execute` `remote_session_execute` `remote_cancel` `remote_session_create` `remote_session_list` `remote_session_close` | ✗ |
+| 命令与会话 | `remote_status` | ✓ |
+| 文件读写 | `remote_write_file` `remote_edit_file` `remote_upload_base64` | ✗ |
+| 文件读写 | `remote_read_file` `remote_list_dir` `remote_stat` `remote_download_base64` | ✓ |
+| 搜索与日志 | `remote_search_content` `remote_find_files` `remote_tail_log` | ✓ |
+| 文件管理 | `remote_move_file` `remote_copy_file` `remote_delete_file` `remote_make_dir` | ✗ |
+| 主机洞察 | `remote_list_processes` `remote_check_port` `remote_get_env_info` | ✓ |
+
+"只读模式"列标 ✓ 的 11 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 13 个会被强制下线。
 
 下面按分组给出每个工具的参数与用法。参数表中"必填"列标 `*` 的为必填;示例为 MCP `tools/call` 的 `arguments` 内容。
 
@@ -371,9 +382,55 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_get_env_info`
 
-一次性环境画像,无参数:OS/内核/架构、主机名、用户、shell、locale、内存/负载、36 个常用工具链(python3、rg、rsync、mysql 等)的可用性与版本、服务端配置(FSRoots、工具黑名单、限额)。会话开局调一次,替代一串 `which` / `--version` / `uname` 探测。
+一次性环境画像,无参数:OS/内核/架构、主机名、用户、shell、locale、内存/负载、36 个常用工具链(python3、rg、rsync、mysql 等)的可用性与版本、服务端配置(只读模式标志、FSRoots、工具黑名单、限额)。会话开局调一次,替代一串 `which` / `--version` / `uname` 探测。
 
 ## 安全机制
+
+### 只读模式(ReadOnly)
+
+`SHELL_API_READONLY` 是本服务**优先级最高**的开关。开启后服务退化为纯读取代理:只保留 11 个读取类工具,命令执行、会话、写 / 编辑 / 删除 / 移动 / 复制 / 建目录全部下线,且**运行时无法恢复**——它不受 `SHELL_API_DISABLED_TOOLS`、请求参数或任何后续配置影响。
+
+```bash
+# 一键开启(取值 1 / true / yes / on / enabled,大小写不敏感)
+SHELL_API_TOKEN=xxx SHELL_API_READONLY=true ./remote-agent-proxy
+
+# 启动脚本方式
+./start.sh start-ro          # 后台启动
+./start.sh foreground-ro     # 前台启动
+./start.sh restart-ro        # 只读模式重启
+./start.sh readonly-check    # 校验只读是否真正生效
+```
+
+四层独立强制,任何单层失效都不会打开写通路:
+
+| 层 | 位置 | 作用 |
+| --- | --- | --- |
+| 1. 工具注册 | `config.go` `toolEnabled` + 各 `register*` | 13 个写工具**不注册**,`tools/list` 里根本不存在 |
+| 2. REST 路由 | `main.go` | `/api/execute`、`/api/execute/stream`、`/api/sessions*`、`/api/executions/*` 返回 403 `read_only_mode` |
+| 3. HTTP 中间件 | `middleware.go` `ReadOnlyMiddleware` | `/api/` 下只放行 GET / HEAD,新增端点默认被拦 |
+| 4. 操作兜底 | `readonly.go` `guardReadOnly` | `WriteFileContent` / `EditFileContent` / `UploadBase64` / `MoveFile` / `CopyFile` / `DeleteFile` / `MakeDir` / `Executor.Execute` / `ExecuteStream` / `LintFile` 内部直接失败 |
+
+第 1 层用的是**白名单**(`readonly.go` 的 `readOnlyTools`):将来新增的工具在未被显式审计并加入白名单前一律禁用,漏改代码的后果是"少一个读工具",而不是"多一个写通路"。第 4 层保证即使注册层被绕过(例如后续误加了一个未走 `toolEnabled` 的注册点),底层操作仍然拒绝执行。
+
+只读模式下允许的 11 个工具:
+
+```
+remote_read_file  remote_list_dir  remote_stat  remote_search_content
+remote_find_files  remote_tail_log  remote_download_base64
+remote_list_processes  remote_check_port  remote_get_env_info  remote_status
+```
+
+可与黑名单叠加进一步收窄(只能更严,不能更宽):
+
+```bash
+SHELL_API_READONLY=true \
+SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
+./remote-agent-proxy      # 最终只剩 9 个工具
+```
+
+模式对客户端是自描述的:MCP handshake 里 server name 变为 `remote-shell-readonly` 并带上 instructions 说明,`/api/status` 与 `remote_get_env_info` 返回 `read_only: true`,响应头带 `X-Read-Only: true`。
+
+**建议同时设置 `SHELL_API_FS_ROOT`**:只读模式管住"能不能改",FSRoot 管住"能读到哪";两者正交。若要更强的保证,可再用一个对目标目录只有读权限的系统账户运行本服务。
 
 ### 文件沙箱(FSRoot)
 
@@ -391,15 +448,16 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 ### 工具黑名单(DisabledTools)
 
-`SHELL_API_DISABLED_TOOLS` 是一份逗号分隔的工具名单,列出的工具在启动时**不会注册**,对客户端完全不可见(而非运行时拒绝)。可用于按最小权限裁剪服务能力,例如做成"只读文件"服务:
+`SHELL_API_DISABLED_TOOLS` 是一份逗号分隔的工具名单,列出的工具在启动时**不会注册**,对客户端完全不可见(而非运行时拒绝)。可用于按最小权限裁剪服务能力,做精细化的能力剪裁:
 
 ```bash
-# 禁用命令执行与一切写操作,仅保留只读文件与状态查询
-SHELL_API_DISABLED_TOOLS=remote_execute,remote_session_execute,remote_cancel,remote_write_file,remote_edit_file,remote_upload_base64 \
-./remote-agent-proxy
+# 保留命令执行但禁掉删除与上传
+SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-proxy
 ```
 
 可禁用的工具名即上文列出的 24 个。
+
+如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,拦不住 `/api/execute` 等 REST 端点,漏写一个工具名就留一个写通路。
 
 ### 审计日志
 
@@ -410,22 +468,27 @@ SHELL_API_DISABLED_TOOLS=remote_execute,remote_session_execute,remote_cancel,rem
 
 ## 安全须知
 
-本服务在网络边界上等同于一个交互式 shell,部署前请务必:
+本服务在默认(读写)模式下,在网络边界上等同于一个交互式 shell,部署前请务必:
 
-1. **启用 TLS**,避免 Token 与命令内容在传输中泄露
-2. **使用强随机 Token**,不要硬编码进代码仓库
-3. **设置 `FSRoot`** 把文件操作限制在指定目录,缩小爆炸半径;可传入多个目录前缀
-4. **按需启用工具黑名单** 用 `SHELL_API_DISABLED_TOOLS` 禁掉不需要的能力(如命令执行),遵循最小权限原则
-5. **不要暴露到公网**,应放在 VPN / 内网之后,或配合反向代理与额外鉴权
-6. 将 `[AUDIT]` 审计日志做集中收集与审计
+1. **只需要读就开只读模式** 设 `SHELL_API_READONLY=true`,这是唯一能真正关闭全部写通路的开关,优先级高于其他一切配置
+2. **启用 TLS**,避免 Token 与命令内容在传输中泄露
+3. **使用强随机 Token**,不要硬编码进代码仓库
+4. **设置 `FSRoot`** 把文件操作限制在指定目录,缩小爆炸半径;可传入多个目录前缀
+5. **按需启用工具黑名单** 用 `SHELL_API_DISABLED_TOOLS` 禁掉不需要的能力,遵循最小权限原则
+6. **不要暴露到公网**,应放在 VPN / 内网之后,或配合反向代理与额外鉴权
+7. 将 `[AUDIT]` 审计日志做集中收集与审计
+8. 用**只有读权限的系统账户**运行服务,作为与应用层无关的兜底
 
 如发现安全漏洞,请通过 GitHub Security Advisory 私下报告,不要直接开公开 Issue。
 
 ## 开发
 
 ```bash
-# 运行全部测试(文件操作 / 搜索 / 日志 / 删除安全 / 脱敏 / 进程解析等)
+# 运行全部测试(文件操作 / 搜索 / 日志 / 删除安全 / 脱敏 / 进程解析 / 只读模式等)
 go test ./...
+
+# 仅运行只读模式相关测试
+go test -run 'ReadOnly' -v ./...
 
 # 跨平台编译
 GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy

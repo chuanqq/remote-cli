@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -91,6 +92,29 @@ func RateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rl.maxPerMin))
 		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(rl.Remaining(key)))
 
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ReadOnlyMiddleware is layer 3 of read-only enforcement: a blanket method
+// filter over the REST surface. Only GET/HEAD survive under /api/, so a
+// mutating endpoint added later is denied before its handler is reached.
+//
+// /mcp is exempt because MCP rides on POST by protocol; its calls are gated by
+// tool registration (layer 1) plus the operation guards (layer 4).
+func ReadOnlyMiddleware(readOnly bool, next http.Handler) http.Handler {
+	if !readOnly {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") &&
+			r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("X-Read-Only", "true")
+			writeError(w, http.StatusForbidden, "read_only_mode",
+				"Server is in read-only mode: "+r.Method+" "+r.URL.Path+" is disabled")
+			return
+		}
+		w.Header().Set("X-Read-Only", "true")
 		next.ServeHTTP(w, r)
 	})
 }

@@ -8,3 +8,8 @@
 /remote-agent-proxy
 /dist/
 /server
+# start.sh sources .env, which holds SHELL_API_TOKEN — never commit it.
+# .env.readonly.example is a token-free template and stays tracked.
+.env
+/remote-agent-proxy.pid
+/remote-agent-proxy.log
