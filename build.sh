@@ -16,6 +16,10 @@
 #   STRIP     1=精简体积(-s -w,默认)  0=保留调试信息
 #   VERSION   覆盖版本号(默认从 types.go 的 serverVersion 提取)
 #
+# 版本信息通过 -ldflags -X 注入 main.serverVersion / main.gitCommit /
+# main.buildTime,运行态可经 --version、/api/status、remote_status、
+# remote_get_env_info 与 MCP 握手 serverInfo.version 查看。
+#
 # 说明: darwin 目标依赖 cgo(sysinfo_darwin.go),只能在 macOS 主机上构建;
 #       linux / windows 目标使用 CGO_ENABLED=0 静态编译,可在任意主机交叉编译。
 
@@ -31,6 +35,14 @@ STRIP="${STRIP:-1}"
 # 版本号: 优先环境变量,其次从 types.go 提取,兜底 dev
 VERSION="${VERSION:-$(grep -oE 'serverVersion = "[^"]+"' types.go 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)}"
 VERSION="${VERSION:-dev}"
+
+# 构建元信息: 短 commit(工作区有未提交改动时追加 -dirty)与 UTC 构建时间
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ "$GIT_COMMIT" != "unknown" ]] && [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+    GIT_COMMIT="${GIT_COMMIT}-dirty"
+fi
+BUILD_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+VERSION_LDFLAGS="-X main.serverVersion=${VERSION} -X main.gitCommit=${GIT_COMMIT} -X main.buildTime=${BUILD_TIME}"
 
 # 预设目标平台(all)
 PRESET_TARGETS=(
@@ -50,7 +62,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 HOST_OS="$(go env GOOS 2>/dev/null || echo unknown)"
 
 print_help() {
-    sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 print_list() {
@@ -86,12 +98,12 @@ build_one() {
         cgo=1
     fi
 
-    local ldflags=""
-    [[ "$STRIP" == "1" ]] && ldflags="-s -w"
+    local ldflags="${VERSION_LDFLAGS}"
+    [[ "$STRIP" == "1" ]] && ldflags="-s -w ${ldflags}"
 
     log_info "构建 ${os}/${arch} (cgo=${cgo}) -> ${out}"
     CGO_ENABLED="${cgo}" GOOS="${os}" GOARCH="${arch}" \
-        go build ${ldflags:+-ldflags="${ldflags}"} -o "${out}" .
+        go build -ldflags="${ldflags}" -o "${out}" .
 
     local size
     size=$(du -h "${out}" | cut -f1)
@@ -114,7 +126,7 @@ main() {
     # 无参数: 构建当前平台
     if [[ $# -eq 0 ]]; then
         mkdir -p "${OUT_DIR}"
-        log_info "版本: ${VERSION} | 输出目录: ${OUT_DIR} | strip: ${STRIP}"
+        log_info "版本: ${VERSION} (${GIT_COMMIT}) | 输出目录: ${OUT_DIR} | strip: ${STRIP}"
         build_one "$(go env GOOS)" "$(go env GOARCH)"
         return
     fi
@@ -125,7 +137,7 @@ main() {
     esac
 
     mkdir -p "${OUT_DIR}"
-    log_info "版本: ${VERSION} | 输出目录: ${OUT_DIR} | strip: ${STRIP}"
+    log_info "版本: ${VERSION} (${GIT_COMMIT}) | 输出目录: ${OUT_DIR} | strip: ${STRIP}"
 
     local targets=()
     if [[ "$1" == "all" ]]; then

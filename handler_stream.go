@@ -72,7 +72,7 @@ func (h *StreamHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	var durationMs int64
 	var outputLines int
 
-	h.executor.ExecuteStream(req, func(event StreamEvent) {
+	h.executor.ExecuteStream(r.Context(), req, func(event StreamEvent) {
 		if event.Type == "stdout" || event.Type == "stderr" {
 			outputLines++
 		}
@@ -88,8 +88,9 @@ func (h *StreamHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	close(done)
 
 	h.audit.Log(AuditEntry{
-		SourceIP:         r.RemoteAddr,
-		Tool:             "execute_stream",
+		ReqID:            reqIDFrom(r.Context()),
+		SourceIP:         remoteHost(r.RemoteAddr),
+		Tool:             "rest_execute_stream",
 		Command:          req.Command,
 		WorkingDirectory: req.WorkingDirectory,
 		ExitCode:         exitCode,

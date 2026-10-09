@@ -13,8 +13,14 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLogger, cfg *Config) http.Handler {
-	opts := []server.ServerOption{server.WithToolCapabilities(true)}
+func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManager, audit *AuditLogger, cfg *Config) http.Handler {
+	opts := []server.ServerOption{
+		server.WithToolCapabilities(true),
+		// Every tool call is audited by one middleware (tool name, duration,
+		// outcome, request id, peer, MCP session); see mcp_audit.go.
+		server.WithToolHandlerMiddleware(withAudit(audit)),
+		server.WithHooks(mcpMethodHooks()),
+	}
 	name := "remote-shell"
 	if cfg.ReadOnly {
 		// Announce the mode in the handshake so clients (and the agents driving
@@ -31,22 +37,25 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 				"if a change is required, report the exact command or diff for a human to apply.",
 		))
 	}
-	s := server.NewMCPServer(name, serverVersion, opts...)
+	s := server.NewMCPServer(name, fullVersion(), opts...)
 	startTime := time.Now()
 
-	registerFileTools(s, audit, cfg)
-	registerSystemTools(s, audit, cfg)
-	registerSessionTools(s, sessions, audit, cfg)
+	registerFileTools(s, cfg)
+	registerSystemTools(s, cfg)
+	registerSessionTools(s, sessions, cfg)
+	registerJobTools(s, jobs, cfg)
+	registerWaitTool(s, executor, jobs, cfg)
 
 	if cfg.toolEnabled("remote_execute") {
 		s.AddTool(mcp.NewTool("remote_execute",
-			mcp.WithDescription("Execute a single shell command on the remote server and return exit code, stdout, stderr, and timing. Prefer working_directory over `cd X && ...` prefixes. For searching, log viewing, or file inspection prefer the dedicated tools (remote_search_content, remote_find_files, remote_tail_log, remote_read_file, ...): they return structured results and never fail on zero matches. Commands producing huge output should redirect to a file and be read back via remote_read_file/remote_tail_log instead of relying on stdout capture."),
+			mcp.WithDescription("Execute a single shell command on the remote server and wait for it, returning exit code, stdout, stderr, and timing. Default timeout 30s (timeout_ms raises it up to the server max). Prefer working_directory over `cd X && ...` prefixes. For searching, log viewing, or file inspection prefer the dedicated tools (remote_search_content, remote_find_files, remote_tail_log, remote_read_file, ...): they return structured results and never fail on zero matches. Do NOT poll with `sleep N; check` — use remote_wait_for. Do NOT start background processes with `nohup ... &` — use remote_spawn. Output beyond max_output_bytes is dropped (stdout_total_bytes tells how much there was); redirect huge output to a file and read it back with remote_read_file/remote_tail_log. Paths are resolved on the remote server, not on the client machine."),
 			mcp.WithString("command", mcp.Required(), mcp.Description("Shell command to execute."), mcp.MaxLength(10000)),
-			mcp.WithString("working_directory", mcp.Description("Working directory for the command. Prefer this over `cd X && ...` prefixes.")),
+			mcp.WithString("working_directory", mcp.Description("Working directory on the remote server. Prefer this over `cd X && ...` prefixes.")),
 			mcp.WithObject("environment", mcp.Description("Additional environment variables as key-value pairs.")),
-			mcp.WithNumber("timeout_ms", mcp.Description("Execution timeout in milliseconds.")),
-			mcp.WithNumber("max_output_bytes", mcp.Description("Maximum captured bytes for stdout and stderr.")),
+			mcp.WithNumber("timeout_ms", mcp.Description("Execution timeout in milliseconds. Default 30000.")),
+			mcp.WithNumber("max_output_bytes", mcp.Description("Maximum captured bytes for stdout and stderr each.")),
 			mcp.WithString("truncate_mode", mcp.Description("Which end to keep when output exceeds max_output_bytes: \"head\" (default) or \"tail\" (better for logs)."), mcp.Enum("head", "tail")),
+			mcp.WithString("output_encoding", mcp.Description("Decode stdout/stderr to UTF-8 from this encoding: utf-8 (default, raw), gbk, gb2312, gb18030, or auto (keep valid UTF-8, else decode as GBK). Use gbk/auto for programs and logs that print GBK Chinese."), mcp.Enum("utf-8", "gbk", "gb2312", "gb18030", "auto")),
 			mcp.WithString("shell", mcp.Description("Shell binary to use (defaults to server config).")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			command := req.GetString("command", "")
@@ -65,24 +74,15 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 				MaxOutputBytes:   req.GetInt("max_output_bytes", 0),
 				Shell:            req.GetString("shell", ""),
 				TruncateMode:     req.GetString("truncate_mode", ""),
+				OutputEncoding:   req.GetString("output_encoding", ""),
 			}
 
-			result := executor.Execute(execReq)
+			result := executor.Execute(ctx, execReq)
+			noteExecAudit(ctx, result, execReq.Command, execReq.WorkingDirectory, "")
 
-			audit.Log(AuditEntry{
-				RequestID:        result.ID,
-				SourceIP:         sourceIP(req.Header),
-				Tool:             "remote_execute",
-				Command:          execReq.Command,
-				WorkingDirectory: execReq.WorkingDirectory,
-				ExitCode:         result.ExitCode,
-				DurationMs:       result.DurationMs,
-				OutputBytes:      len(result.Stdout) + len(result.Stderr),
-				Truncated:        result.StdoutTruncated || result.StderrTruncated,
-				TimedOut:         result.TimedOut,
-			})
-
-			return jsonResult(execResultResponse(result)), nil
+			resp := execResultResponse(result)
+			resp.Hint = commandHint(command)
+			return jsonResult(resp), nil
 		})
 	}
 
@@ -93,6 +93,7 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 			mcp.WithString("command", mcp.Required(), mcp.Description("Shell command to execute. A bare `cd <dir>` updates the session cwd on success."), mcp.MaxLength(10000)),
 			mcp.WithObject("environment", mcp.Description("Extra environment variables for this call (merged over the session env).")),
 			mcp.WithNumber("timeout_ms", mcp.Description("Execution timeout in milliseconds.")),
+			mcp.WithString("output_encoding", mcp.Description("Decode stdout/stderr to UTF-8 from this encoding: utf-8 (default), gbk, gb2312, gb18030, auto."), mcp.Enum("utf-8", "gbk", "gb2312", "gb18030", "auto")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			sessionID := req.GetString("session_id", "")
 			if sessionID == "" {
@@ -109,11 +110,13 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 				return mcp.NewToolResultError("command is required"), nil
 			}
 
+			cwd := sess.Cwd()
 			execReq := ExecuteRequest{
 				Command:          command,
-				WorkingDirectory: sess.WorkingDirectory,
+				WorkingDirectory: cwd,
 				Shell:            sess.Shell,
 				TimeoutMs:        req.GetInt("timeout_ms", 0),
+				OutputEncoding:   req.GetString("output_encoding", ""),
 				Environment:      make(map[string]string),
 			}
 			for _, e := range sess.Environment {
@@ -126,10 +129,10 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 				execReq.Environment[k] = v
 			}
 
-			result := executor.Execute(execReq)
+			result := executor.Execute(ctx, execReq)
 
 			if strings.HasPrefix(strings.TrimSpace(command), "cd ") && !strings.ContainsAny(command, "&;|><\x60()") && result.ExitCode == 0 {
-				pwdResult := executor.ExecuteInDir(sess.Shell, command+" && pwd", sess.WorkingDirectory, sess.Environment, 5000)
+				pwdResult := executor.ExecuteInDir(ctx, sess.Shell, command+" && pwd", cwd, sess.Environment, 5000)
 				if pwdResult.ExitCode == 0 {
 					newDir := strings.TrimSpace(pwdResult.Stdout)
 					if newDir != "" {
@@ -138,33 +141,21 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 				}
 			}
 
-			audit.Log(AuditEntry{
-				RequestID:        result.ID,
-				SourceIP:         sourceIP(req.Header),
-				Tool:             "remote_session_execute",
-				SessionID:        sessionID,
-				Command:          execReq.Command,
-				WorkingDirectory: sess.WorkingDirectory,
-				ExitCode:         result.ExitCode,
-				DurationMs:       result.DurationMs,
-				OutputBytes:      len(result.Stdout) + len(result.Stderr),
-				Truncated:        result.StdoutTruncated || result.StderrTruncated,
-				TimedOut:         result.TimedOut,
-			})
-
+			noteExecAudit(ctx, result, execReq.Command, cwd, sessionID)
 			return jsonResult(execResultResponse(result)), nil
 		})
 	}
 
 	if cfg.toolEnabled("remote_cancel") {
 		s.AddTool(mcp.NewTool("remote_cancel",
-			mcp.WithDescription("Cancel a running execution by its ID."),
+			mcp.WithDescription("Cancel a running execution by its ID (kills its whole process group). For background work started with remote_spawn use remote_job_kill. Note that cancelling the MCP request itself (or disconnecting) also stops a remote_execute call."),
 			mcp.WithString("execution_id", mcp.Required(), mcp.Description("Execution ID returned by remote_execute or remote_session_execute.")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			id := req.GetString("execution_id", "")
 			if id == "" {
 				return mcp.NewToolResultError("execution_id is required"), nil
 			}
+			noteAudit(ctx, func(n *auditNote) { n.Command = "cancel " + id; n.ExecID = id })
 
 			if executor.Cancel(id) {
 				return mcp.NewToolResultText(fmt.Sprintf("execution %s cancelled", id)), nil
@@ -181,6 +172,8 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 			status := StatusResponse{
 				Status:         "healthy",
 				Version:        serverVersion,
+				Commit:         gitCommit,
+				BuildTime:      buildTime,
 				UptimeSeconds:  int64(time.Since(startTime).Seconds()),
 				ActiveSessions: sessions.Count(),
 				ReadOnly:       cfg.ReadOnly,
@@ -197,7 +190,29 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, audit *AuditLog
 		})
 	}
 
-	return server.NewStreamableHTTPServer(s)
+	return server.NewStreamableHTTPServer(s,
+		// Inject the real peer address (and request correlation) into every
+		// MCP request context.
+		server.WithHTTPContextFunc(mcpHTTPContext),
+		// Ping the GET stream so idle middleboxes stop cutting it (~5 min in
+		// production, followed by a full re-initialize each time).
+		server.WithHeartbeatInterval(cfg.MCPHeartbeat),
+	)
+}
+
+// noteExecAudit fills the audit record of a command-running tool.
+func noteExecAudit(ctx context.Context, r *ExecResult, command, dir, sessionID string) {
+	noteAudit(ctx, func(n *auditNote) {
+		n.Command = command
+		n.WorkingDirectory = dir
+		n.ExecID = r.ID
+		n.SessionID = sessionID
+		n.ExitCode = r.ExitCode
+		n.OutputBytes = len(r.Stdout) + len(r.Stderr)
+		n.Truncated = r.StdoutTruncated || r.StderrTruncated
+		n.TimedOut = r.TimedOut
+		n.Error = r.Error
+	})
 }
 
 func execResultResponse(r *ExecResult) ExecuteResponse {
@@ -214,6 +229,10 @@ func execResultResponse(r *ExecResult) ExecuteResponse {
 		TimedOut:         r.TimedOut,
 		StdoutTruncated:  r.StdoutTruncated,
 		StderrTruncated:  r.StderrTruncated,
+		StdoutTotalBytes: r.StdoutTotalBytes,
+		StderrTotalBytes: r.StderrTotalBytes,
+		OutputEncoding:   r.OutputEncoding,
+		Error:            r.Error,
 	}
 }
 
@@ -235,18 +254,6 @@ func extractEnv(req mcp.CallToolRequest, key string) map[string]string {
 		env[k] = fmt.Sprint(v)
 	}
 	return env
-}
-
-func sourceIP(header http.Header) string {
-	if header != nil {
-		if xff := header.Get("X-Forwarded-For"); xff != "" {
-			return strings.TrimSpace(strings.Split(xff, ",")[0])
-		}
-		if xri := header.Get("X-Real-IP"); xri != "" {
-			return strings.TrimSpace(xri)
-		}
-	}
-	return "mcp"
 }
 
 func jsonResult(v any) *mcp.CallToolResult {

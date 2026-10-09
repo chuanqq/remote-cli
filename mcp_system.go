@@ -12,18 +12,11 @@ import (
 // registerSystemTools adds host-introspection tools (processes, ports,
 // environment profile) to the MCP server. These read system state only and
 // are NOT sandboxed by FSRoots (they touch no file contents).
-func registerSystemTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
-	auditCall := func(req mcp.CallToolRequest, tool, descriptor string, ok bool) {
-		exit := 0
-		if !ok {
-			exit = 1
-		}
-		audit.Log(AuditEntry{
-			SourceIP: sourceIP(req.Header),
-			Tool:     tool,
-			Command:  descriptor,
-			ExitCode: exit,
-		})
+func registerSystemTools(s *server.MCPServer, cfg *Config) {
+	// auditCall describes the call for the withAudit middleware, which adds
+	// the registered tool name, timing and the failure reason.
+	auditCall := func(ctx context.Context, descriptor string) {
+		noteAudit(ctx, func(n *auditNote) { n.Command = descriptor })
 	}
 
 	if cfg.toolEnabled("remote_list_processes") {
@@ -37,10 +30,10 @@ func registerSystemTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
 				User:   req.GetString("user", ""),
 			})
 			if err != nil {
-				auditCall(req, "list_processes", "list_processes", false)
+				auditCall(ctx, "list_processes")
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditCall(req, "list_processes", "list_processes", true)
+			auditCall(ctx, "list_processes")
 			return jsonResult(result), nil
 		})
 	}
@@ -57,10 +50,10 @@ func registerSystemTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
 				ProcessName: req.GetString("process_name", ""),
 			})
 			if err != nil {
-				auditCall(req, "check_port", fmt.Sprintf("check_port %d", port), false)
+				auditCall(ctx, fmt.Sprintf("check_port %d", port))
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditCall(req, "check_port", fmt.Sprintf("check_port %d", port), true)
+			auditCall(ctx, fmt.Sprintf("check_port %d", port))
 			return jsonResult(result), nil
 		})
 	}
@@ -69,7 +62,7 @@ func registerSystemTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
 		s.AddTool(mcp.NewTool("remote_get_env_info",
 			mcp.WithDescription("One-call environment profile of the remote server: OS/kernel/arch, hostname, user, shells, locale, memory/load, availability+version of common toolchains (python3, rg, rsync, mysql, ...), and the server config (FSRoots, disabled tools, limits). Call once at the start of a session instead of probing with which/--version/uname commands."),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			auditCall(req, "get_env_info", "get_env_info", true)
+			auditCall(ctx, "get_env_info")
 			return jsonResult(GetEnvInfo(cfg)), nil
 		})
 	}
@@ -77,18 +70,9 @@ func registerSystemTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
 
 // registerSessionTools adds the session lifecycle tools so MCP clients can
 // create/list/close persistent sessions without falling back to the REST API.
-func registerSessionTools(s *server.MCPServer, sessions *SessionManager, audit *AuditLogger, cfg *Config) {
-	auditCall := func(req mcp.CallToolRequest, tool, descriptor string, ok bool) {
-		exit := 0
-		if !ok {
-			exit = 1
-		}
-		audit.Log(AuditEntry{
-			SourceIP: sourceIP(req.Header),
-			Tool:     tool,
-			Command:  descriptor,
-			ExitCode: exit,
-		})
+func registerSessionTools(s *server.MCPServer, sessions *SessionManager, cfg *Config) {
+	auditCall := func(ctx context.Context, sessionID, descriptor string) {
+		noteAudit(ctx, func(n *auditNote) { n.Command = descriptor; n.SessionID = sessionID })
 	}
 
 	if cfg.toolEnabled("remote_session_create") {
@@ -105,10 +89,10 @@ func registerSessionTools(s *server.MCPServer, sessions *SessionManager, audit *
 				Environment:      extractEnv(req, "environment"),
 				TTLSeconds:       req.GetInt("ttl_seconds", 0),
 			})
-			auditCall(req, "session_create", "session_create "+sess.ID, true)
+			auditCall(ctx, sess.ID, "session_create "+sess.ID)
 			return jsonResult(SessionResponse{
 				SessionID:        sess.ID,
-				WorkingDirectory: sess.WorkingDirectory,
+				WorkingDirectory: sess.Cwd(),
 				CreatedAt:        sess.CreatedAt.Format(time.RFC3339),
 				ExpiresAt:        sess.ExpiresAt.Format(time.RFC3339),
 				Shell:            sess.Shell,
@@ -125,13 +109,13 @@ func registerSessionTools(s *server.MCPServer, sessions *SessionManager, audit *
 			for _, sess := range list {
 				sessionsOut = append(sessionsOut, SessionResponse{
 					SessionID:        sess.ID,
-					WorkingDirectory: sess.WorkingDirectory,
+					WorkingDirectory: sess.Cwd(),
 					CreatedAt:        sess.CreatedAt.Format(time.RFC3339),
 					ExpiresAt:        sess.ExpiresAt.Format(time.RFC3339),
 					Shell:            sess.Shell,
 				})
 			}
-			auditCall(req, "session_list", "session_list", true)
+			auditCall(ctx, "", "session_list")
 			return jsonResult(struct {
 				Sessions []SessionResponse `json:"sessions"`
 				Count    int               `json:"count"`
@@ -149,10 +133,10 @@ func registerSessionTools(s *server.MCPServer, sessions *SessionManager, audit *
 				return mcp.NewToolResultError("session_id is required"), nil
 			}
 			if sessions.Delete(sessionID) {
-				auditCall(req, "session_close", "session_close "+sessionID, true)
+				auditCall(ctx, sessionID, "session_close "+sessionID)
 				return mcp.NewToolResultText(fmt.Sprintf("session %s closed", sessionID)), nil
 			}
-			auditCall(req, "session_close", "session_close "+sessionID, false)
+			auditCall(ctx, sessionID, "session_close "+sessionID)
 			return mcp.NewToolResultError("session not found: " + sessionID), nil
 		})
 	}

@@ -36,6 +36,8 @@ func (h *StatusHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, StatusResponse{
 		Status:         "healthy",
 		Version:        serverVersion,
+		Commit:         gitCommit,
+		BuildTime:      buildTime,
 		UptimeSeconds:  int64(time.Since(h.startTime).Seconds()),
 		ActiveSessions: h.sessions.Count(),
 		ReadOnly:       isReadOnly(),

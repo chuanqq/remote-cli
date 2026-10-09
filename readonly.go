@@ -141,6 +141,12 @@ var allToolNames = []string{
 	"remote_copy_file",
 	"remote_delete_file",
 	"remote_make_dir",
+	"remote_spawn",
+	"remote_job_status",
+	"remote_job_list",
+	"remote_job_logs",
+	"remote_job_kill",
+	"remote_wait_for",
 }
 
 // parseReadOnly interprets the SHELL_API_READONLY value. Accepted truthy forms:

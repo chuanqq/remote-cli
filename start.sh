@@ -37,7 +37,8 @@ LOG_FILE="${SCRIPT_DIR}/remote-agent-proxy.log"
 : "${SHELL_API_TOKEN:=}"
 : "${SHELL_API_MAX_TIMEOUT:=300}"
 : "${SHELL_API_MAX_OUTPUT:=1048576}"
-: "${SHELL_API_RATE_LIMIT:=60}"
+: "${SHELL_API_RATE_LIMIT:=120}"
+: "${SHELL_API_RATE_BURST:=60}"
 : "${SHELL_API_DEFAULT_SHELL:=bash}"
 : "${SHELL_API_FS_ROOT:=}"
 : "${SHELL_API_DISABLED_TOOLS:=}"
@@ -95,7 +96,13 @@ cmd_build() {
         log_error "未找到 Go 编译器，请先安装 Go 1.23+"
         exit 1
     fi
-    go build -o "${BINARY}" .
+    local version commit build_time
+    version="${VERSION:-$(grep -oE 'serverVersion = "[^"]+"' types.go 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)}"
+    version="${version:-dev}"
+    commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    go build -ldflags "-X main.serverVersion=${version} -X main.gitCommit=${commit} -X main.buildTime=${build_time}" \
+        -o "${BINARY}" .
     log_info "编译完成: ${BINARY}"
 }
 
@@ -136,6 +143,7 @@ cmd_start() {
     export SHELL_API_MAX_TIMEOUT
     export SHELL_API_MAX_OUTPUT
     export SHELL_API_RATE_LIMIT
+    export SHELL_API_RATE_BURST
     export SHELL_API_DEFAULT_SHELL
     export SHELL_API_FS_ROOT
     export SHELL_API_DISABLED_TOOLS
@@ -161,7 +169,7 @@ cmd_start() {
     fi
     echo "  超时上限:  ${SHELL_API_MAX_TIMEOUT}s"
     echo "  输出上限:  ${SHELL_API_MAX_OUTPUT} 字节"
-    echo "  限流:      ${SHELL_API_RATE_LIMIT}/分钟"
+    echo "  限流:      ${SHELL_API_RATE_LIMIT}/分钟（突发 ${SHELL_API_RATE_BURST}，按客户端 IP）"
     echo "  默认 Shell: ${SHELL_API_DEFAULT_SHELL}"
     if [[ -n "${SHELL_API_FS_ROOT}" ]]; then
         echo "  文件沙箱:  ${SHELL_API_FS_ROOT}"
@@ -244,14 +252,16 @@ cmd_stop() {
         return 0
     fi
 
-    log_info "正在停止服务 (PID: ${pid}) ..."
+    # SIGTERM 触发服务端优雅退出：执行中的命令最多再跑 SHELL_API_SHUTDOWN_GRACE
+    # 秒（默认 30），这里多等 5 秒再兜底 kill -9。
+    local limit=$(( ${SHELL_API_SHUTDOWN_GRACE:-30} + 5 ))
+    log_info "正在停止服务 (PID: ${pid})，最多等待 ${limit}s ..."
     kill "${pid}"
 
-    # 等待进程退出（最多等 10 秒）
     local waited=0
-    while kill -0 "${pid}" 2>/dev/null && [[ ${waited} -lt 10 ]]; do
+    while kill -0 "${pid}" 2>/dev/null && [[ ${waited} -lt ${limit} ]]; do
         sleep 1
-        ((waited++))
+        ((waited++)) || true
     done
 
     if kill -0 "${pid}" 2>/dev/null; then
@@ -353,6 +363,7 @@ cmd_foreground() {
     export SHELL_API_MAX_TIMEOUT
     export SHELL_API_MAX_OUTPUT
     export SHELL_API_RATE_LIMIT
+    export SHELL_API_RATE_BURST
     export SHELL_API_DEFAULT_SHELL
     export SHELL_API_FS_ROOT
     export SHELL_API_DISABLED_TOOLS
@@ -465,7 +476,8 @@ cmd_readonly_check() {
             for t in remote_execute remote_session_execute remote_cancel remote_write_file \
                      remote_edit_file remote_upload_base64 remote_move_file remote_copy_file \
                      remote_delete_file remote_make_dir remote_session_create \
-                     remote_session_list remote_session_close; do
+                     remote_session_list remote_session_close remote_spawn remote_job_status \
+                     remote_job_list remote_job_logs remote_job_kill remote_wait_for; do
                 if [[ "${tools}" == *"\"${t}\""* ]]; then
                     leaked="${leaked} ${t}"
                 fi
@@ -549,7 +561,8 @@ case "${1:-}" in
         echo "  SHELL_API_TOKEN        Bearer Token（必填，未设置时会自动生成）"
         echo "  SHELL_API_MAX_TIMEOUT  命令超时上限秒数（默认: 300）"
         echo "  SHELL_API_MAX_OUTPUT   输出字节上限（默认: 1048576）"
-        echo "  SHELL_API_RATE_LIMIT   每 IP 每分钟请求上限（默认: 60）"
+        echo "  SHELL_API_RATE_LIMIT   每客户端 IP 每分钟请求补充速率（默认: 120）"
+        echo "  SHELL_API_RATE_BURST   每客户端 IP 突发容量（默认: 60）"
         echo "  SHELL_API_DEFAULT_SHELL 默认 shell（默认: bash）"
         echo "  SHELL_API_FS_ROOT      文件沙箱根目录，逗号分隔可多个（默认: 不限制）"
         echo "  SHELL_API_DISABLED_TOOLS 禁用的 MCP 工具，逗号分隔（默认: 不禁用）"

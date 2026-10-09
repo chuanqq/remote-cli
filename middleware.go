@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,87 +10,129 @@ import (
 	"time"
 )
 
-func LoggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s %v", r.RemoteAddr, r.Method, r.URL.Path, time.Since(start))
-	})
-}
-
+// RateLimiter is a per-host token bucket: capacity `burst`, refilled
+// continuously at `perMin` tokens per minute.
+//
+// The key is the peer HOST, never host:port. Keying on r.RemoteAddr (as an
+// earlier version did) gave every new TCP connection a fresh full bucket, so
+// the limit never engaged: in production one client sent 85 requests in a
+// minute over 84 source ports against a configured 60/min.
+//
+// A token bucket (rather than a fixed per-minute window) absorbs the bursts a
+// legitimate MCP client produces — every reconnect is initialize +
+// notifications/initialized + tools/list back to back — while still capping the
+// sustained rate.
 type RateLimiter struct {
-	mu        sync.Mutex
-	tokens    map[string]*bucket
-	maxPerMin int
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	perMin  int
+	burst   int
+	now     func() time.Time // injectable for tests
 }
 
 type bucket struct {
-	tokens    int
-	lastReset time.Time
+	tokens   float64
+	lastSeen time.Time
 }
 
-func NewRateLimiter(maxPerMin int) *RateLimiter {
-	return &RateLimiter{
-		tokens:    make(map[string]*bucket),
-		maxPerMin: maxPerMin,
+// bucketIdleTTL: a bucket untouched this long has refilled to capacity anyway,
+// so dropping it loses nothing and keeps the map bounded under port scans.
+const bucketIdleTTL = 2 * time.Minute
+
+func NewRateLimiter(perMin, burst int) *RateLimiter {
+	if burst <= 0 {
+		burst = perMin
 	}
+	rl := &RateLimiter{
+		buckets: make(map[string]*bucket),
+		perMin:  perMin,
+		burst:   burst,
+		now:     time.Now,
+	}
+	go rl.cleanupLoop()
+	return rl
 }
 
-func (rl *RateLimiter) Allow(key string) bool {
+// refill brings b up to date and returns it. Caller holds rl.mu.
+func (rl *RateLimiter) refill(key string, now time.Time) *bucket {
+	b, ok := rl.buckets[key]
+	if !ok {
+		b = &bucket{tokens: float64(rl.burst), lastSeen: now}
+		rl.buckets[key] = b
+		return b
+	}
+	elapsed := now.Sub(b.lastSeen).Minutes()
+	if elapsed > 0 {
+		b.tokens += elapsed * float64(rl.perMin)
+		if b.tokens > float64(rl.burst) {
+			b.tokens = float64(rl.burst)
+		}
+	}
+	b.lastSeen = now
+	return b
+}
+
+// Allow consumes one token for key and reports whether the request may pass,
+// plus the whole tokens left afterwards.
+func (rl *RateLimiter) Allow(key string) (bool, int) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	now := time.Now()
-	b, ok := rl.tokens[key]
-	if !ok {
-		rl.tokens[key] = &bucket{tokens: rl.maxPerMin - 1, lastReset: now}
-		return true
+	b := rl.refill(key, rl.now())
+	if b.tokens < 1 {
+		return false, 0
 	}
-
-	if now.Sub(b.lastReset) >= time.Minute {
-		b.tokens = rl.maxPerMin - 1
-		b.lastReset = now
-		return true
-	}
-
-	if b.tokens <= 0 {
-		return false
-	}
-
 	b.tokens--
-	return true
+	return true, int(b.tokens)
 }
 
-func (rl *RateLimiter) Remaining(key string) int {
+// Len reports the number of tracked buckets (for tests).
+func (rl *RateLimiter) Len() int {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-
-	b, ok := rl.tokens[key]
-	if !ok {
-		return rl.maxPerMin
-	}
-	if time.Since(b.lastReset) >= time.Minute {
-		return rl.maxPerMin
-	}
-	return b.tokens
+	return len(rl.buckets)
 }
 
+// sweep drops buckets idle for longer than bucketIdleTTL.
+func (rl *RateLimiter) sweep() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := rl.now()
+	for k, b := range rl.buckets {
+		if now.Sub(b.lastSeen) > bucketIdleTTL {
+			delete(rl.buckets, k)
+		}
+	}
+}
+
+func (rl *RateLimiter) cleanupLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		rl.sweep()
+	}
+}
+
+// RateLimitMiddleware applies the per-host limit. Exempt from counting:
+// /api/status (health probes) and the MCP GET stream, which is a keep-alive
+// channel clients reopen on their own schedule, not a unit of work.
 func RateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/status" {
+		if r.URL.Path == "/api/status" || isMCPStream(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		key := r.RemoteAddr
-		if !rl.Allow(key) {
-			w.Header().Set("Retry-After", "60")
+		ok, remaining := rl.Allow(remoteHost(r.RemoteAddr))
+		if !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(60.0/float64(rl.perMin)))))
 			writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Too many requests")
 			return
 		}
 
-		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rl.maxPerMin))
-		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(rl.Remaining(key)))
+		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rl.perMin))
+		w.Header().Set("X-RateLimit-Burst", strconv.Itoa(rl.burst))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 
 		next.ServeHTTP(w, r)
 	})

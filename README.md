@@ -6,7 +6,7 @@
 
 **English:** A single-binary MCP (Model Context Protocol) server written in Go that lets AI agents (such as Claude Code) securely operate remote hosts. It exposes 24 dedicated tools over Streamable HTTP — shell execution with persistent sessions, file read/write/edit, server-side content search, log tailing with cursors and follow, process/port inspection and an environment profile — so the agent rarely needs to fall back to raw shell commands.
 
-一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 24 个专用工具:命令执行与持久会话、文件读写编辑、服务端内容搜索、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
+一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 30 个专用工具:命令执行与持久会话、后台任务与条件等待、文件读写编辑、服务端内容搜索、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
 
 编译产物为单二进制,零外部运行时依赖;TLS 与 Bearer Token 鉴权开箱即用。
 
@@ -14,14 +14,16 @@
 
 ## 特性
 
-- **命令执行**:同步执行、可取消,基于进程组的硬超时控制,输出截断可选保留头部或尾部(`truncate_mode`)
+- **命令执行**:同步执行、可取消(含客户端断开),基于进程组的硬超时控制,有界输出捕获可选保留头部或尾部(`truncate_mode`),可选 GBK 等输出解码(`output_encoding`)
+- **后台任务与等待**:`remote_spawn` 启动脱离调用的后台任务并按 job id 查询/读日志/终止;`remote_wait_for` 服务端等待文件/日志/进程/端口/命令条件,满足即返回
 - **持久会话**:维护 cwd / shell / 环境变量,`cd` 后自动同步工作目录,带 TTL 自动回收;会话的创建/列出/销毁均有对应 MCP 工具
 - **文件操作**:读 / 写 / 编辑 / 列目录 / stat / 移动 / 复制 / 删除 / 建目录,支持 UTF-8 / GBK / GB2312 / GB18030 编码互转与自动探测,大文件支持 base64 分块上传下载;写入类操作返回 sha256/mode 自检,可选 bash/python 语法 lint
 - **内容搜索与日志**:服务端实现的内容正则搜索、文件名查找、大日志尾部/增量/跟随读取,不依赖目标机 grep/rg/find
 - **主机洞察**:进程枚举、监听端口检查、一次性环境画像(36 个常用工具链探测)
+- **运维**:SIGTERM 优雅退出、构建时注入版本与 commit、MCP 长连接心跳
 - **只读模式**:`SHELL_API_READONLY=true` 一键将服务降级为纯读取代理,四层强制、运行时不可恢复,优先级高于其他所有配置
-- **安全控制**:Bearer Token 鉴权、按 IP 限流、输出字节上限、超时上限、可选多目录 `FSRoot` 文件系统沙箱、工具黑名单、删除工具双重确认
-- **可观测**:结构化审计日志,记录每次调用(含 tool 名、session、截断标记),并对 mysql 密码、Bearer token 等敏感信息自动脱敏
+- **安全控制**:Bearer Token 鉴权(常量时间比较)、按客户端 IP 的令牌桶限流、可选跳板命令拦截、输出字节上限、超时上限、可选多目录 `FSRoot` 文件系统沙箱、工具黑名单、删除工具双重确认
+- **可观测**:JSON 结构化访问日志(含状态码)与审计日志,通过 `req_id` 关联,记录每次调用的真实来源 IP、工具名、耗时与失败原因,并对 mysql 密码、Bearer token 等敏感信息自动脱敏
 
 ## 平台支持
 
@@ -77,7 +79,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 }
 ```
 
-连通后客户端 `tools/list` 应能看到全部 24 个工具。服务另有免鉴权的 `GET /api/status` 健康探针,可用于负载均衡或监控探活。
+连通后客户端 `tools/list` 应能看到全部 30 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 29 个)。服务另有免鉴权的 `GET /api/status` 健康探针,可用于负载均衡或监控探活。
 
 ## 配置项
 
@@ -92,24 +94,32 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_TLS_KEY` | (空) | TLS 私钥路径 |
 | `SHELL_API_MAX_TIMEOUT` | `300` | 单次命令超时上限(秒) |
 | `SHELL_API_MAX_OUTPUT` | `1048576` | stdout / stderr 字节上限 |
-| `SHELL_API_RATE_LIMIT` | `60` | 每 IP 每分钟请求数上限 |
+| `SHELL_API_RATE_LIMIT` | `120` | 限流令牌桶补充速率(每客户端 IP 每分钟),按 IP 计数(不含端口);`GET /mcp` 长连接与 `/api/status` 不计数 |
+| `SHELL_API_RATE_BURST` | `60` | 限流令牌桶容量(每客户端 IP 可连续突发的请求数) |
 | `SHELL_API_DEFAULT_SHELL` | `bash` | 默认 shell |
 | `SHELL_API_FS_ROOT` | (空) | 文件操作沙箱根目录,支持逗号分隔多个目录前缀,留空则不限制(等同 shell 信任级别) |
 | `SHELL_API_DISABLED_TOOLS` | (空) | 工具黑名单,逗号分隔的 MCP 工具名,启动时不注册,对客户端不可见 |
+| `SHELL_API_LOG_LEVEL` | `info` | 日志级别 `debug` / `info` / `warn` / `error`;`GET /mcp` 长连接的访问行只在 `debug` 下输出 |
+| `SHELL_API_MCP_HEARTBEAT` | `30` | MCP `GET /mcp` 推送流心跳(ping)间隔秒数,防止中间设备空闲断连;`0` 关闭 |
+| `SHELL_API_SHUTDOWN_GRACE` | `30` | 收到 SIGTERM/SIGINT 后,执行中命令的最长宽限秒数,超时后连同进程组一并杀掉 |
+| `SHELL_API_JOB_DIR` | `$TMPDIR/remote-agent-proxy-jobs` | `remote_spawn` 后台任务的日志目录 |
+| `SHELL_API_BLOCK_JUMP_HOST` | (空) | 设为 `true` 时拦截 `ssh` / `gssh` / `scp` / `sftp` / `sshpass` 跳板命令(在跳板机上执行的命令不进入本服务审计) |
+| `SHELL_API_DENY_COMMANDS` | (空) | 自定义命令拦截 RE2 正则,命中即拒绝执行(作用于 execute / session_execute / spawn / wait_for 的 command_exit0);正则非法时拒绝启动 |
 
-## 工具一览(24 个)
+## 工具一览(30 个)
 
 | 分组 | 工具 | 只读模式 |
 | --- | --- | --- |
 | 命令与会话 | `remote_execute` `remote_session_execute` `remote_cancel` `remote_session_create` `remote_session_list` `remote_session_close` | ✗ |
 | 命令与会话 | `remote_status` | ✓ |
+| 后台任务与等待 | `remote_spawn` `remote_job_status` `remote_job_list` `remote_job_logs` `remote_job_kill` `remote_wait_for` | ✗ |
 | 文件读写 | `remote_write_file` `remote_edit_file` `remote_upload_base64` | ✗ |
 | 文件读写 | `remote_read_file` `remote_list_dir` `remote_stat` `remote_download_base64` | ✓ |
 | 搜索与日志 | `remote_search_content` `remote_find_files` `remote_tail_log` | ✓ |
 | 文件管理 | `remote_move_file` `remote_copy_file` `remote_delete_file` `remote_make_dir` | ✗ |
 | 主机洞察 | `remote_list_processes` `remote_check_port` `remote_get_env_info` | ✓ |
 
-"只读模式"列标 ✓ 的 11 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 13 个会被强制下线。
+"只读模式"列标 ✓ 的 11 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 19 个会被强制下线。
 
 下面按分组给出每个工具的参数与用法。参数表中"必填"列标 `*` 的为必填;示例为 MCP `tools/call` 的 `arguments` 内容。
 
@@ -117,7 +127,13 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_execute`
 
-执行单条 shell 命令,返回 exit code / stdout / stderr / 耗时。搜索、看日志、查文件优先用专用工具(结构化返回、零匹配不报错);产出超大输出的命令建议重定向到文件后用 `remote_read_file` / `remote_tail_log` 读回。
+执行单条 shell 命令并等待结束,返回 exit code / stdout / stderr / 耗时。默认超时 30s。搜索、看日志、查文件优先用专用工具(结构化返回、零匹配不报错);需要等待某个条件时用 `remote_wait_for`,不要 `sleep N; check`;需要常驻后台的进程用 `remote_spawn`,不要 `nohup ... &`。
+
+- 输出按 `max_output_bytes` 有界捕获(内存不随输出增长),返回 `stdout_total_bytes` / `stderr_total_bytes` 说明原始输出量
+- 命令未能启动(工作目录不存在、shell 不存在、被拦截)时返回 `exit_code=-1` 与 `error` 说明原因
+- shell 已退出但后台子进程仍占用输出管道时,最多再等 2s 即返回,不会卡到超时
+- 客户端取消请求或断开连接时,命令连同进程组被终止
+- 响应可能带 `hint` 字段,建议更合适的专用工具(仅提示,不影响执行)
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -127,6 +143,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `timeout_ms` | number | | 超时毫秒数,默认取服务端配置 |
 | `max_output_bytes` | number | | stdout/stderr 捕获上限,默认取服务端配置 |
 | `truncate_mode` | string | | 超限保留 `head`(默认)或 `tail`(看日志更友好) |
+| `output_encoding` | string | | 把输出从该编码转为 UTF-8:`utf-8`(默认,原样)、`gbk`、`gb2312`、`gb18030`、`auto`(合法 UTF-8 原样保留,否则按 GBK 解码) |
 | `shell` | string | | 指定 shell,默认取服务端配置 |
 
 ```json
@@ -169,7 +186,43 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_cancel` / `remote_status`
 
-`remote_cancel` 按执行 ID 取消运行中的命令(参数 `execution_id`,必填,来自 execute 的返回)。`remote_status` 无参数,返回服务健康、版本、运行时长、活跃会话数与系统信息。
+`remote_cancel` 按执行 ID 取消运行中的命令(参数 `execution_id`,必填,来自 execute 的返回)。`remote_status` 无参数,返回服务健康、版本(含 `commit` / `build_time`)、运行时长、活跃会话数与系统信息。
+
+### 后台任务与等待
+
+#### `remote_spawn` / `remote_job_*`
+
+`remote_spawn` 以独立会话(setsid)启动后台任务并**立即返回** `job_id`:任务不属于调用方进程组,不受调用超时影响,服务重启也不会被杀;stdout+stderr 写入服务端管理的日志文件(`SHELL_API_JOB_DIR`)。参数:`command`(必填)、`working_directory`、`environment`、`timeout_seconds`(到时杀掉整个进程组,默认不限)、`shell`。
+
+| 工具 | 说明 |
+| --- | --- |
+| `remote_job_status` | `job_id` → 状态 `running` / `exited` / `killed` / `timed_out`、退出码、pid、耗时、日志路径与大小 |
+| `remote_job_list` | 列出任务(新到旧),`running_only` 只看运行中;已结束任务保留 24h |
+| `remote_job_logs` | 读任务日志,参数同 `remote_tail_log`(`lines` / `since_offset` / `follow_seconds` / `filter_regex` / `encoding`),附带任务状态 |
+| `remote_job_kill` | 向任务整个进程组发信号,`signal` 取 `TERM`(默认)/ `INT` / `KILL` |
+
+```json
+{"command": "python3 -u long_job.py", "working_directory": "/data/work", "timeout_seconds": 3600}
+```
+
+#### `remote_wait_for`
+
+服务端轮询,条件满足即返回(附匹配内容),取代 `sleep N; check`。超时返回 `satisfied=false, timed_out=true`。
+
+| condition | target | 说明 |
+| --- | --- | --- |
+| `file_exists` | 路径 | 文件出现 |
+| `file_contains` | 路径 | 全文件任一行匹配 `pattern` |
+| `log_regex` | 日志路径 | 调用开始**之后**追加的行匹配 `pattern`(文件截断/轮转后从头扫) |
+| `process_exit` | pid 或 `job_id` | 进程 / 后台任务退出 |
+| `port_listen` | 端口号 | 端口开始监听 |
+| `command_exit0` | shell 命令 | 每个间隔重跑一次,直到退出码为 0 |
+
+其他参数:`pattern`(RE2)、`ignore_case`、`timeout_seconds`(默认 60,最大 300)、`interval_ms`(默认 1000,最小 200)、`encoding`(文件条件的源编码,如 `gbk`)。
+
+```json
+{"condition": "log_regex", "target": "/data/app/log/app.log", "pattern": "init success|FATAL", "timeout_seconds": 300}
+```
 
 ### 文件读写
 
@@ -405,7 +458,7 @@ SHELL_API_TOKEN=xxx SHELL_API_READONLY=true ./remote-agent-proxy
 
 | 层 | 位置 | 作用 |
 | --- | --- | --- |
-| 1. 工具注册 | `config.go` `toolEnabled` + 各 `register*` | 13 个写工具**不注册**,`tools/list` 里根本不存在 |
+| 1. 工具注册 | `config.go` `toolEnabled` + 各 `register*` | 19 个写工具**不注册**,`tools/list` 里根本不存在 |
 | 2. REST 路由 | `main.go` | `/api/execute`、`/api/execute/stream`、`/api/sessions*`、`/api/executions/*` 返回 403 `read_only_mode` |
 | 3. HTTP 中间件 | `middleware.go` `ReadOnlyMiddleware` | `/api/` 下只放行 GET / HEAD,新增端点默认被拦 |
 | 4. 操作兜底 | `readonly.go` `guardReadOnly` | `WriteFileContent` / `EditFileContent` / `UploadBase64` / `MoveFile` / `CopyFile` / `DeleteFile` / `MakeDir` / `Executor.Execute` / `ExecuteStream` / `LintFile` 内部直接失败 |
@@ -455,15 +508,21 @@ SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
 SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-proxy
 ```
 
-可禁用的工具名即上文列出的 24 个。
+可禁用的工具名即上文列出的 30 个。
 
 如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,拦不住 `/api/execute` 等 REST 端点,漏写一个工具名就留一个写通路。
 
 ### 审计日志
 
-每次工具调用都会输出一行 `[AUDIT]` JSON,字段:`timestamp / request_id / source_ip / tool / session_id / command / working_directory / exit_code / duration_ms / output_bytes / truncated / timed_out`。
+服务的所有日志都是一行一个 JSON 对象(`log/slog`),输出到 stderr。两类记录通过 `req_id` 关联,同一请求的 `req_id` 也在响应头 `X-Request-Id` 中返回:
 
-- `request_id` 缺失时自动生成(`audit-` 前缀),保证每条记录可关联
+- **访问日志** `type=access`:`req_id / remote / method / path / status / bytes / dur_ms`,MCP 请求另带 `mcp_method`(`initialize` / `tools/list` / `tools/call` …)、`tool` 与 `mcp_session`。401 / 429 也会记录。`GET /mcp` 长连接只在 `SHELL_API_LOG_LEVEL=debug` 下记录
+- **审计日志** `type=audit`:每次工具调用一行,由统一的 MCP 工具中间件写入,字段 `req_id / exec_id / remote / mcp_session / tool / session_id / command / working_directory / exit_code / dur_ms / output_bytes / truncated / timed_out / error`。`tool` 一律为注册工具名,`remote` 为真实对端 IP(不含端口),失败时 `error` 给出原因;REST 接口的 `tool` 为 `rest_execute` / `rest_session_execute` / `rest_execute_stream`
+
+```json
+{"time":"...","level":"INFO","msg":"audit","type":"audit","req_id":"r-4497e438","remote":"172.26.97.60","tool":"remote_execute","command":"echo hi","exit_code":0,"dur_ms":5,"output_bytes":3,"timed_out":false,"exec_id":"04034b32-...","mcp_session":"mcp-session-..."}
+```
+
 - `command` 字段在落盘前自动脱敏:`mysql -p<密码>`、`Authorization: Bearer <token>`、`password= / token= / secret= / api_key=` 等形态替换为 `***`
 
 ## 安全须知
@@ -476,7 +535,7 @@ SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-
 4. **设置 `FSRoot`** 把文件操作限制在指定目录,缩小爆炸半径;可传入多个目录前缀
 5. **按需启用工具黑名单** 用 `SHELL_API_DISABLED_TOOLS` 禁掉不需要的能力,遵循最小权限原则
 6. **不要暴露到公网**,应放在 VPN / 内网之后,或配合反向代理与额外鉴权
-7. 将 `[AUDIT]` 审计日志做集中收集与审计
+7. 将 `type=audit` 审计日志做集中收集与审计;如不希望经本机跳转到其他主机执行命令,开启 `SHELL_API_BLOCK_JUMP_HOST=true`
 8. 用**只有读权限的系统账户**运行服务,作为与应用层无关的兜底
 
 如发现安全漏洞,请通过 GitHub Security Advisory 私下报告,不要直接开公开 Issue。
@@ -496,7 +555,7 @@ GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy
 
 ### 构建脚本
 
-`build.sh` 封装了多平台交叉编译,产物统一输出到 `dist/`(命名 `remote-agent-proxy-<版本>-<os>-<arch>`,版本号自动从 `types.go` 提取):
+`build.sh` 封装了多平台交叉编译,产物统一输出到 `dist/`(命名 `remote-agent-proxy-<版本>-<os>-<arch>`,版本号自动从 `types.go` 提取)。构建时通过 `-ldflags -X` 注入 `serverVersion` / `gitCommit`(工作区有未提交改动时带 `-dirty`)/ `buildTime`,运行态可用 `./remote-agent-proxy --version`、`/api/status`、`remote_status`、`remote_get_env_info` 或 MCP 握手的 `serverInfo.version` 查看:
 
 ```bash
 ./build.sh                 # 构建当前平台
@@ -511,6 +570,10 @@ GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy
 - linux / windows 目标以 `CGO_ENABLED=0` 静态编译,可在任意主机交叉编译,拷到低版本 glibc 机器(如 CentOS 7)也能直接跑。
 - darwin 目标依赖 cgo(`sysinfo_darwin.go`),只能在 macOS 主机构建;在非 macOS 主机会自动跳过。
 - 环境变量:`OUT_DIR` 改输出目录、`STRIP=0` 保留调试信息、`VERSION` 覆盖版本号。
+
+### 部署机控制脚本
+
+`control.sh` 是部署机上使用的控制脚本(部署目录放 `control.sh` + 二进制 + 可选的 `env.conf`):`start` / `stop`(SIGTERM 优雅退出,等待 `SHELL_API_SHUTDOWN_GRACE + 5` 秒后兜底 `kill -9`)/ `restart` / `status`(含运行中进程报告的版本与 commit)/ `foreground` / `build`(注入版本信息)/ `version` / `token`。`start.sh` 面向本地开发,额外带只读模式相关子命令。
 
 仅依赖标准库加少量三方包(`google/uuid`、`mark3labs/mcp-go`、`golang.org/x/text`),无外部运行时依赖,单二进制部署。
 

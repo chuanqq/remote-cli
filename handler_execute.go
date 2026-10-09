@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"net/http"
-	"time"
 )
 
 type ExecuteHandler struct {
@@ -37,12 +36,13 @@ func (h *ExecuteHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := h.executor.Execute(req)
+	result := h.executor.Execute(r.Context(), req)
 
 	h.audit.Log(AuditEntry{
-		RequestID:        result.ID,
-		SourceIP:         r.RemoteAddr,
-		Tool:             "execute",
+		ReqID:            reqIDFrom(r.Context()),
+		ExecID:           result.ID,
+		SourceIP:         remoteHost(r.RemoteAddr),
+		Tool:             "rest_execute",
 		Command:          req.Command,
 		WorkingDirectory: req.WorkingDirectory,
 		ExitCode:         result.ExitCode,
@@ -50,6 +50,7 @@ func (h *ExecuteHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		OutputBytes:      len(result.Stdout) + len(result.Stderr),
 		Truncated:        result.StdoutTruncated || result.StderrTruncated,
 		TimedOut:         result.TimedOut,
+		Error:            result.Error,
 	})
 
 	status := http.StatusOK
@@ -57,20 +58,7 @@ func (h *ExecuteHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusRequestTimeout
 	}
 
-	writeJSON(w, status, ExecuteResponse{
-		ID:               result.ID,
-		Command:          result.Command,
-		ExitCode:         result.ExitCode,
-		Stdout:           result.Stdout,
-		Stderr:           result.Stderr,
-		DurationMs:       result.DurationMs,
-		StartedAt:        result.StartedAt.Format(time.RFC3339Nano),
-		CompletedAt:      result.CompletedAt.Format(time.RFC3339Nano),
-		WorkingDirectory: result.WorkingDirectory,
-		TimedOut:         result.TimedOut,
-		StdoutTruncated:  result.StdoutTruncated,
-		StderrTruncated:  result.StderrTruncated,
-	})
+	writeJSON(w, status, execResultResponse(result))
 }
 
 func (h *ExecuteHandler) HandleCancel(w http.ResponseWriter, r *http.Request) {

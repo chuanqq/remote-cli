@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"net/http"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -13,29 +12,24 @@ import (
 
 // registerFileTools adds file operation tools to the MCP server. All tools
 // honor cfg.FSRoots as an optional sandbox, respect the cfg tool blacklist,
-// and reuse the shared audit log.
-func registerFileTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
+// and are audited by the withAudit tool middleware.
+func registerFileTools(s *server.MCPServer, cfg *Config) {
 	roots := cfg.FSRoots
 
-	// auditFileOp records a file operation in the shared audit log, reusing the
-	// AuditEntry shape (Command carries a synthetic "op path" descriptor).
-	auditFileOp := func(header http.Header, op, path string, ok bool, bytes int, truncated bool) {
-		exit := 0
-		if !ok {
-			exit = 1
-		}
-		workDir := ""
-		if len(roots) > 0 {
-			workDir = strings.Join(roots, ",")
-		}
-		audit.Log(AuditEntry{
-			SourceIP:         sourceIP(header),
-			Tool:             "remote_" + op,
-			Command:          op + " " + path,
-			WorkingDirectory: workDir,
-			ExitCode:         exit,
-			OutputBytes:      bytes,
-			Truncated:        truncated,
+	// auditFileOp describes a file operation for the audit record (Command
+	// carries a synthetic "op path" descriptor). Tool name, duration and the
+	// failure reason are filled in by withAudit.
+	auditFileOp := func(ctx context.Context, op, path string, ok bool, bytes int, truncated bool) {
+		noteAudit(ctx, func(n *auditNote) {
+			n.Command = op + " " + path
+			if len(roots) > 0 {
+				n.WorkingDirectory = strings.Join(roots, ",")
+			}
+			if !ok {
+				n.ExitCode = 1
+			}
+			n.OutputBytes = bytes
+			n.Truncated = truncated
 		})
 	}
 
@@ -49,7 +43,7 @@ func registerFileTools(s *server.MCPServer, audit *AuditLogger, cfg *Config) {
 	registerManageTools(s, cfg, roots, auditFileOp)
 }
 
-type fileAuditFunc func(header http.Header, op, path string, ok bool, bytes int, truncated bool)
+type fileAuditFunc func(ctx context.Context, op, path string, ok bool, bytes int, truncated bool)
 
 func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if !cfg.toolEnabled("remote_write_file") {
@@ -81,10 +75,10 @@ func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFi
 			Lint:     req.GetString("lint", ""),
 		}, roots)
 		if err != nil {
-			auditFileOp(req.Header, "write_file", path, false, 0, false)
+			auditFileOp(ctx, "write_file", path, false, 0, false)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		auditFileOp(req.Header, "write_file", result.Path, true, result.BytesWritten, false)
+		auditFileOp(ctx, "write_file", result.Path, true, result.BytesWritten, false)
 		return jsonResult(result), nil
 	})
 }
@@ -120,10 +114,10 @@ func registerReadTool(s *server.MCPServer, cfg *Config, roots []string, auditFil
 			TruncateMode: req.GetString("truncate_mode", ""),
 		}, roots)
 		if err != nil {
-			auditFileOp(req.Header, "read_file", path, false, 0, false)
+			auditFileOp(ctx, "read_file", path, false, 0, false)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		auditFileOp(req.Header, "read_file", result.Path, true, len(result.Content), result.Truncated)
+		auditFileOp(ctx, "read_file", result.Path, true, len(result.Content), result.Truncated)
 		return jsonResult(result), nil
 	})
 }
@@ -185,10 +179,10 @@ func registerEditTool(s *server.MCPServer, cfg *Config, roots []string, auditFil
 
 		result, err := EditFileContent(editReq, roots)
 		if err != nil {
-			auditFileOp(req.Header, "edit_file", path, false, 0, false)
+			auditFileOp(ctx, "edit_file", path, false, 0, false)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		auditFileOp(req.Header, "edit_file", result.Path, true, 0, false)
+		auditFileOp(ctx, "edit_file", result.Path, true, 0, false)
 		return jsonResult(result), nil
 	})
 }
@@ -214,10 +208,10 @@ func registerListStatTools(s *server.MCPServer, cfg *Config, roots []string, aud
 				IncludeHidden: req.GetBool("include_hidden", false),
 			}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "list_dir", path, false, 0, false)
+				auditFileOp(ctx, "list_dir", path, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "list_dir", result.Path, true, result.Count, false)
+			auditFileOp(ctx, "list_dir", result.Path, true, result.Count, false)
 			return jsonResult(result), nil
 		})
 	}
@@ -240,10 +234,10 @@ func registerListStatTools(s *server.MCPServer, cfg *Config, roots []string, aud
 				IncludeEncoding: req.GetBool("include_encoding", false),
 			}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "stat", path, false, 0, false)
+				auditFileOp(ctx, "stat", path, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "stat", result.Path, true, 0, false)
+			auditFileOp(ctx, "stat", result.Path, true, 0, false)
 			return jsonResult(result), nil
 		})
 	}
@@ -276,10 +270,10 @@ func registerBase64Tools(s *server.MCPServer, cfg *Config, roots []string, audit
 				Mode:     req.GetString("mode", ""),
 			}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "upload_base64", path, false, 0, false)
+				auditFileOp(ctx, "upload_base64", path, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "upload_base64", result.Path, true, result.BytesWritten, false)
+			auditFileOp(ctx, "upload_base64", result.Path, true, result.BytesWritten, false)
 			return jsonResult(result), nil
 		})
 	}
@@ -302,10 +296,10 @@ func registerBase64Tools(s *server.MCPServer, cfg *Config, roots []string, audit
 				MaxBytes: req.GetInt("max_bytes", 0),
 			}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "download_base64", path, false, 0, false)
+				auditFileOp(ctx, "download_base64", path, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "download_base64", result.Path, true, result.BytesRead, false)
+			auditFileOp(ctx, "download_base64", result.Path, true, result.BytesRead, false)
 			return jsonResult(result), nil
 		})
 	}
@@ -344,10 +338,10 @@ func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, audit
 				IncludeHidden: req.GetBool("include_hidden", false),
 			}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "search_content", path, false, 0, false)
+				auditFileOp(ctx, "search_content", path, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "search_content", path, true, result.TotalMatches, result.Truncated)
+			auditFileOp(ctx, "search_content", path, true, result.TotalMatches, result.Truncated)
 			return jsonResult(result), nil
 		})
 	}
@@ -378,10 +372,10 @@ func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, audit
 				IncludeHidden: req.GetBool("include_hidden", false),
 			}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "find_files", path, false, 0, false)
+				auditFileOp(ctx, "find_files", path, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "find_files", path, true, result.Count, result.Truncated)
+			auditFileOp(ctx, "find_files", path, true, result.Count, result.Truncated)
 			return jsonResult(result), nil
 		})
 	}
@@ -419,10 +413,10 @@ func registerTailLogTool(s *server.MCPServer, cfg *Config, roots []string, audit
 			MaxBytes:      req.GetInt("max_bytes", 0),
 		}, roots)
 		if err != nil {
-			auditFileOp(req.Header, "tail_log", path, false, 0, false)
+			auditFileOp(ctx, "tail_log", path, false, 0, false)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		auditFileOp(req.Header, "tail_log", path, true, len(result.Content), result.Truncated)
+		auditFileOp(ctx, "tail_log", path, true, len(result.Content), result.Truncated)
 		return jsonResult(result), nil
 	})
 }
@@ -445,10 +439,10 @@ func registerManageTools(s *server.MCPServer, cfg *Config, roots []string, audit
 			}
 			result, err := MoveFile(MoveFileRequest{Src: src, Dst: dst, Overwrite: req.GetBool("overwrite", false)}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "move_file", src+" -> "+dst, false, 0, false)
+				auditFileOp(ctx, "move_file", src+" -> "+dst, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "move_file", src+" -> "+dst, true, 0, false)
+			auditFileOp(ctx, "move_file", src+" -> "+dst, true, 0, false)
 			return jsonResult(result), nil
 		})
 	}
@@ -466,10 +460,10 @@ func registerManageTools(s *server.MCPServer, cfg *Config, roots []string, audit
 			}
 			result, err := CopyFile(CopyFileRequest{Src: src, Dst: dst, Overwrite: req.GetBool("overwrite", false)}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "copy_file", src+" -> "+dst, false, 0, false)
+				auditFileOp(ctx, "copy_file", src+" -> "+dst, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "copy_file", src+" -> "+dst, true, result.EntriesCopied+int(result.BytesCopied), false)
+			auditFileOp(ctx, "copy_file", src+" -> "+dst, true, result.EntriesCopied+int(result.BytesCopied), false)
 			return jsonResult(result), nil
 		})
 	}
@@ -498,10 +492,10 @@ func registerManageTools(s *server.MCPServer, cfg *Config, roots []string, audit
 					Confirm:   req.GetBool("confirm", false),
 				}, roots)
 				if err != nil {
-					auditFileOp(req.Header, "delete_file", path, false, 0, false)
+					auditFileOp(ctx, "delete_file", path, false, 0, false)
 					return mcp.NewToolResultError(err.Error()), nil
 				}
-				auditFileOp(req.Header, "delete_file", path, true, result.Entries, false)
+				auditFileOp(ctx, "delete_file", path, true, result.Entries, false)
 				return jsonResult(result), nil
 			})
 		}
@@ -524,10 +518,10 @@ func registerManageTools(s *server.MCPServer, cfg *Config, roots []string, audit
 				Parents: req.GetBool("parents", true),
 			}, roots)
 			if err != nil {
-				auditFileOp(req.Header, "make_dir", path, false, 0, false)
+				auditFileOp(ctx, "make_dir", path, false, 0, false)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(req.Header, "make_dir", result.Path, true, 0, false)
+			auditFileOp(ctx, "make_dir", result.Path, true, 0, false)
 			return jsonResult(result), nil
 		})
 	}

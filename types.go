@@ -1,11 +1,31 @@
 package main
 
-import (
-	"time"
+import "fmt"
+
+// Build metadata. serverVersion keeps a source default so `go build` without
+// ldflags still reports something sensible; build.sh / control.sh / start.sh
+// override all three via -ldflags "-X main.serverVersion=... -X main.gitCommit=...
+// -X main.buildTime=...". They must stay package-level vars (not consts) for
+// -X to take effect.
+var (
+	serverVersion = "1.1.0"
+	gitCommit     = "unknown"
+	buildTime     = "unknown"
 )
 
-// serverVersion is reported by /api/status, remote_status and remote_get_env_info.
-const serverVersion = "1.1.0"
+// fullVersion is the single-line version string used by the startup log,
+// --version and the MCP handshake (serverInfo.version), e.g. "1.1.0+a5e9ecc".
+func fullVersion() string {
+	if gitCommit == "" || gitCommit == "unknown" {
+		return serverVersion
+	}
+	return serverVersion + "+" + gitCommit
+}
+
+// versionBanner is the human-readable output of --version.
+func versionBanner() string {
+	return fmt.Sprintf("remote-agent-proxy %s (commit %s, built %s)", serverVersion, gitCommit, buildTime)
+}
 
 type ExecuteRequest struct {
 	Command          string            `json:"command"`
@@ -16,7 +36,11 @@ type ExecuteRequest struct {
 	Shell            string            `json:"shell,omitempty"`
 	// TruncateMode picks which end of an over-limit stdout/stderr to keep:
 	// "head" (default, first bytes) or "tail" (last bytes, better for logs).
-	TruncateMode     string            `json:"truncate_mode,omitempty"`
+	TruncateMode string `json:"truncate_mode,omitempty"`
+	// OutputEncoding converts captured stdout/stderr to UTF-8 before returning:
+	// "" / "utf-8" (raw bytes, default), "gbk", "gb2312", "gb18030", or "auto"
+	// (valid UTF-8 is kept as-is, otherwise decoded as GBK).
+	OutputEncoding string `json:"output_encoding,omitempty"`
 }
 
 type ExecuteResponse struct {
@@ -32,6 +56,18 @@ type ExecuteResponse struct {
 	TimedOut         bool   `json:"timed_out"`
 	StdoutTruncated  bool   `json:"stdout_truncated"`
 	StderrTruncated  bool   `json:"stderr_truncated"`
+	// Total bytes the command wrote, before truncation. When larger than
+	// len(stdout)/len(stderr) the difference was dropped by max_output_bytes.
+	StdoutTotalBytes int64 `json:"stdout_total_bytes"`
+	StderrTotalBytes int64 `json:"stderr_total_bytes"`
+	// OutputEncoding is the source encoding stdout/stderr were decoded from
+	// (only set when output_encoding was requested).
+	OutputEncoding string `json:"output_encoding,omitempty"`
+	// Error explains a failure to launch the command at all (bad working
+	// directory, missing shell, denied by policy). Empty when it ran.
+	Error string `json:"error,omitempty"`
+	// Hint is an advisory nudge towards a better-suited tool (MCP only).
+	Hint string `json:"hint,omitempty"`
 }
 
 type StreamEvent struct {
@@ -60,6 +96,8 @@ type SessionResponse struct {
 type StatusResponse struct {
 	Status         string `json:"status"`
 	Version        string `json:"version"`
+	Commit         string `json:"commit"`
+	BuildTime      string `json:"build_time"`
 	UptimeSeconds  int64  `json:"uptime_seconds"`
 	ActiveSessions int    `json:"active_sessions"`
 	// ReadOnly reports whether the server refuses all mutating operations.
@@ -82,17 +120,21 @@ type ErrorResponse struct {
 	RequestID string `json:"request_id,omitempty"`
 }
 
+// AuditEntry is one audit record. It is emitted as a flat structured log line
+// (type=audit) sharing req_id with the access log line of the same request.
 type AuditEntry struct {
-	Timestamp        time.Time `json:"timestamp"`
-	RequestID        string    `json:"request_id"`
-	SourceIP         string    `json:"source_ip"`
-	Tool             string    `json:"tool,omitempty"`
-	SessionID        string    `json:"session_id,omitempty"`
-	Command          string    `json:"command"`
-	WorkingDirectory string    `json:"working_directory"`
-	ExitCode         int       `json:"exit_code"`
-	DurationMs       int64     `json:"duration_ms"`
-	OutputBytes      int       `json:"output_bytes"`
-	Truncated        bool      `json:"truncated,omitempty"`
-	TimedOut         bool      `json:"timed_out"`
+	ReqID            string // HTTP request correlation id (X-Request-Id)
+	ExecID           string // execution / job id, for command-running tools
+	SourceIP         string // real peer host
+	MCPSession       string // Mcp-Session-Id, MCP calls only
+	Tool             string // registered tool name, or REST endpoint label
+	SessionID        string // remote_session_* session
+	Command          string // command line or synthetic "op path" descriptor
+	WorkingDirectory string
+	ExitCode         int
+	DurationMs       int64
+	OutputBytes      int
+	Truncated        bool
+	TimedOut         bool
+	Error            string // failure reason, when the call failed
 }

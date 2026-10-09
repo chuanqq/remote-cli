@@ -9,13 +9,32 @@ import (
 	"github.com/google/uuid"
 )
 
+// Session is a persistent execution context. WorkingDirectory is the only
+// field mutated after creation (by a successful `cd`), and it is read
+// concurrently by other calls on the same session, so it is guarded by mu and
+// must be accessed through Cwd / setCwd.
 type Session struct {
-	ID               string
-	WorkingDirectory string
-	Environment      []string
-	Shell            string
-	CreatedAt        time.Time
-	ExpiresAt        time.Time
+	ID          string
+	Environment []string
+	Shell       string
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+
+	mu               sync.RWMutex
+	workingDirectory string
+}
+
+// Cwd returns the session's current working directory.
+func (s *Session) Cwd() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.workingDirectory
+}
+
+func (s *Session) setCwd(dir string) {
+	s.mu.Lock()
+	s.workingDirectory = dir
+	s.mu.Unlock()
 }
 
 type SessionManager struct {
@@ -56,7 +75,7 @@ func (sm *SessionManager) Create(req SessionCreateRequest) *Session {
 
 	sess := &Session{
 		ID:               id,
-		WorkingDirectory: dir,
+		workingDirectory: dir,
 		Environment:      env,
 		Shell:            shell,
 		CreatedAt:        time.Now(),
@@ -115,8 +134,7 @@ func (sm *SessionManager) UpdateWorkingDirectory(id, dir string) {
 	if !ok {
 		return
 	}
-	sess := v.(*Session)
-	sess.WorkingDirectory = dir
+	v.(*Session).setCwd(dir)
 }
 
 func (sm *SessionManager) cleanupLoop() {

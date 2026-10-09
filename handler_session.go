@@ -32,7 +32,7 @@ func (h *SessionHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusCreated, SessionResponse{
 		SessionID:        sess.ID,
-		WorkingDirectory: sess.WorkingDirectory,
+		WorkingDirectory: sess.Cwd(),
 		CreatedAt:        sess.CreatedAt.Format(time.RFC3339),
 		ExpiresAt:        sess.ExpiresAt.Format(time.RFC3339),
 		Shell:            sess.Shell,
@@ -78,7 +78,8 @@ func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Use session's working directory and environment
-	req.WorkingDirectory = sess.WorkingDirectory
+	cwd := sess.Cwd()
+	req.WorkingDirectory = cwd
 	req.Shell = sess.Shell
 	if req.Environment == nil {
 		req.Environment = make(map[string]string)
@@ -92,13 +93,13 @@ func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result := h.executor.Execute(req)
+	result := h.executor.Execute(r.Context(), req)
 
 	// Sync session cwd after a pure cd. Run "cmd && pwd" in one subprocess so
 	// the directory change takes effect before pwd reports it; skip compound
 	// commands to avoid re-running side effects (e.g. "cd x && ls").
 	if strings.HasPrefix(strings.TrimSpace(req.Command), "cd ") && !strings.ContainsAny(req.Command, "&;|><\x60()") && result.ExitCode == 0 {
-		pwdResult := h.executor.ExecuteInDir(sess.Shell, req.Command+" && pwd", sess.WorkingDirectory, sess.Environment, 5000)
+		pwdResult := h.executor.ExecuteInDir(r.Context(), sess.Shell, req.Command+" && pwd", cwd, sess.Environment, 5000)
 		if pwdResult.ExitCode == 0 {
 			newDir := strings.TrimSpace(pwdResult.Stdout)
 			if newDir != "" {
@@ -108,17 +109,19 @@ func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.audit.Log(AuditEntry{
-		RequestID:        result.ID,
-		SourceIP:         r.RemoteAddr,
-		Tool:             "session_execute",
+		ReqID:            reqIDFrom(r.Context()),
+		ExecID:           result.ID,
+		SourceIP:         remoteHost(r.RemoteAddr),
+		Tool:             "rest_session_execute",
 		SessionID:        sessionID,
 		Command:          req.Command,
-		WorkingDirectory: sess.WorkingDirectory,
+		WorkingDirectory: cwd,
 		ExitCode:         result.ExitCode,
 		DurationMs:       result.DurationMs,
 		OutputBytes:      len(result.Stdout) + len(result.Stderr),
 		Truncated:        result.StdoutTruncated || result.StderrTruncated,
 		TimedOut:         result.TimedOut,
+		Error:            result.Error,
 	})
 
 	status := http.StatusOK
@@ -126,20 +129,9 @@ func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusRequestTimeout
 	}
 
-	writeJSON(w, status, ExecuteResponse{
-		ID:               result.ID,
-		Command:          result.Command,
-		ExitCode:         result.ExitCode,
-		Stdout:           result.Stdout,
-		Stderr:           result.Stderr,
-		DurationMs:       result.DurationMs,
-		StartedAt:        result.StartedAt.Format(time.RFC3339Nano),
-		CompletedAt:      result.CompletedAt.Format(time.RFC3339Nano),
-		WorkingDirectory: sess.WorkingDirectory,
-		TimedOut:         result.TimedOut,
-		StdoutTruncated:  result.StdoutTruncated,
-		StderrTruncated:  result.StderrTruncated,
-	})
+	resp := execResultResponse(result)
+	resp.WorkingDirectory = cwd
+	writeJSON(w, status, resp)
 }
 
 func (h *SessionHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {

@@ -1,21 +1,42 @@
 package main
 
 import (
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	Port         string
-	Token        string
-	TLSCert      string
-	TLSKey       string
-	MaxTimeout   int
-	MaxOutput    int
-	RateLimit    int
+	Port       string
+	Token      string
+	TLSCert    string
+	TLSKey     string
+	MaxTimeout int
+	MaxOutput  int
+	RateLimit  int
+	// RateBurst is the token-bucket capacity per client host: how many
+	// requests may arrive back to back before the RateLimit/min refill rate
+	// takes over.
+	RateBurst    int
 	DefaultShell string
+	// LogLevel filters the structured log: debug|info|warn|error. The MCP GET
+	// keep-alive stream is only logged at debug.
+	LogLevel string
+	// MCPHeartbeat is the ping interval on the MCP GET stream; it keeps idle
+	// middleboxes from cutting the connection. 0 disables.
+	MCPHeartbeat time.Duration
+	// ShutdownGrace is how long in-flight executions may keep running after
+	// SIGTERM/SIGINT before they are killed.
+	ShutdownGrace time.Duration
+	// JobDir holds the combined stdout/stderr log of every remote_spawn job.
+	JobDir string
+	// DenyCommand, when non-nil, rejects any shell command (execute, session
+	// execute, spawn, wait_for command) matching it before anything runs.
+	DenyCommand *regexp.Regexp
 	// FSRoots, when non-empty, sandboxes all file operation tools to these
 	// directories: a path is allowed if it falls under ANY of the roots.
 	// Empty means no filesystem restriction (file ops span the whole host,
@@ -32,15 +53,25 @@ type Config struct {
 
 func LoadConfig() *Config {
 	cfg := &Config{
-		Port:         getEnv("SHELL_API_PORT", "8080"),
-		Token:        getEnv("SHELL_API_TOKEN", ""),
-		TLSCert:      getEnv("SHELL_API_TLS_CERT", ""),
-		TLSKey:       getEnv("SHELL_API_TLS_KEY", ""),
-		MaxTimeout:   getEnvInt("SHELL_API_MAX_TIMEOUT", 300),
-		MaxOutput:    getEnvInt("SHELL_API_MAX_OUTPUT", 1048576),
-		RateLimit:    getEnvInt("SHELL_API_RATE_LIMIT", 60),
-		DefaultShell: getEnv("SHELL_API_DEFAULT_SHELL", "bash"),
+		Port:          getEnv("SHELL_API_PORT", "8080"),
+		Token:         getEnv("SHELL_API_TOKEN", ""),
+		TLSCert:       getEnv("SHELL_API_TLS_CERT", ""),
+		TLSKey:        getEnv("SHELL_API_TLS_KEY", ""),
+		MaxTimeout:    getEnvInt("SHELL_API_MAX_TIMEOUT", 300),
+		MaxOutput:     getEnvInt("SHELL_API_MAX_OUTPUT", 1048576),
+		RateLimit:     getEnvInt("SHELL_API_RATE_LIMIT", 120),
+		RateBurst:     getEnvInt("SHELL_API_RATE_BURST", 60),
+		DefaultShell:  getEnv("SHELL_API_DEFAULT_SHELL", "bash"),
+		LogLevel:      getEnv("SHELL_API_LOG_LEVEL", "info"),
+		MCPHeartbeat:  time.Duration(getEnvInt("SHELL_API_MCP_HEARTBEAT", 30)) * time.Second,
+		ShutdownGrace: time.Duration(getEnvInt("SHELL_API_SHUTDOWN_GRACE", 30)) * time.Second,
+		JobDir:        getEnv("SHELL_API_JOB_DIR", filepath.Join(os.TempDir(), "remote-agent-proxy-jobs")),
 	}
+
+	cfg.DenyCommand = buildDenyPattern(
+		getEnv("SHELL_API_DENY_COMMANDS", ""),
+		parseReadOnly(getEnv("SHELL_API_BLOCK_JUMP_HOST", "")),
+	)
 
 	// SHELL_API_FS_ROOT accepts a comma-separated list of directory prefixes.
 	// Comma (not colon) is the separator so Windows drive paths keep working.
@@ -64,6 +95,33 @@ func LoadConfig() *Config {
 	cfg.applyReadOnly(readOnlyFromEnv())
 
 	return cfg
+}
+
+// jumpHostPattern matches a command that starts (or chains into) a login to
+// ANOTHER host: ssh/gssh/scp/sftp/sshpass at the start of a pipeline segment,
+// optionally behind sudo. Anything run over such a hop escapes this server's
+// audit log entirely. `ssh-keygen`, `sshd` etc. are not matched.
+const jumpHostPattern = "(?:^|[;&|()`\\n]|\\$\\()\\s*(?:sudo\\s+)?(?:gssh|ssh|scp|sftp|sshpass)(?:\\s|$)"
+
+// buildDenyPattern combines the operator regex (SHELL_API_DENY_COMMANDS) with
+// the built-in jump-host pattern (SHELL_API_BLOCK_JUMP_HOST). An operator
+// regex that fails to compile is fatal: silently ignoring a security control
+// is worse than refusing to start.
+func buildDenyPattern(custom string, blockJump bool) *regexp.Regexp {
+	var parts []string
+	if blockJump {
+		parts = append(parts, jumpHostPattern)
+	}
+	if custom = strings.TrimSpace(custom); custom != "" {
+		if _, err := regexp.Compile(custom); err != nil {
+			log.Fatalf("SHELL_API_DENY_COMMANDS is not a valid RE2 regex: %v", err)
+		}
+		parts = append(parts, "(?:"+custom+")")
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return regexp.MustCompile(strings.Join(parts, "|"))
 }
 
 // applyReadOnly turns read-only mode on when enabled is true. It is idempotent

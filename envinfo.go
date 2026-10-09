@@ -39,7 +39,9 @@ type ToolProbe struct {
 
 // ServerProfile is the operator-facing server configuration snapshot.
 type ServerProfile struct {
-	Version string `json:"version"`
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildTime string `json:"build_time"`
 	// ReadOnly reports read-only mode. When true every mutating tool is
 	// unregistered and mutating REST endpoints answer 403.
 	ReadOnly      bool     `json:"read_only"`
@@ -48,6 +50,13 @@ type ServerProfile struct {
 	MaxTimeoutSec int      `json:"max_timeout_sec"`
 	MaxOutput     int      `json:"max_output"`
 	RateLimit     int      `json:"rate_limit"`
+	RateBurst     int      `json:"rate_burst"`
+	// DenyCommands is the effective command deny regex (jump-host blocking
+	// and/or operator patterns); empty when nothing is denied.
+	DenyCommands string `json:"deny_commands,omitempty"`
+	// Note reminds agents that every path and command is resolved on THIS
+	// host, not on the machine the MCP client runs on.
+	Note string `json:"note"`
 }
 
 // EnvInfoResult is a one-call environment profile: replaces the usual
@@ -110,12 +119,18 @@ func GetEnvInfo(cfg *Config) *EnvInfoResult {
 		Tools:        probeTools(probeToolList),
 		Server: ServerProfile{
 			Version:       serverVersion,
+			Commit:        gitCommit,
+			BuildTime:     buildTime,
 			ReadOnly:      cfg.ReadOnly,
 			FSRoots:       cfg.FSRoots,
 			DisabledTools: disabled,
 			MaxTimeoutSec: cfg.MaxTimeout,
 			MaxOutput:     cfg.MaxOutput,
 			RateLimit:     cfg.RateLimit,
+			RateBurst:     cfg.RateBurst,
+			DenyCommands:  denyString(cfg),
+			Note: "This is the REMOTE host " + hostname + ": paths, working directories and commands are " +
+				"resolved here, not on the client machine.",
 		},
 	}
 }
@@ -164,4 +179,11 @@ func kernelRelease() string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func denyString(cfg *Config) string {
+	if cfg.DenyCommand == nil {
+		return ""
+	}
+	return cfg.DenyCommand.String()
 }

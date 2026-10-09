@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -201,7 +202,7 @@ func TestReadOnlyBlocksExecutor(t *testing.T) {
 
 	withReadOnly(t)
 
-	res := exec.Execute(ExecuteRequest{Command: "touch " + marker})
+	res := exec.Execute(context.Background(), ExecuteRequest{Command: "touch " + marker})
 	if res.ExitCode == 0 {
 		t.Error("Execute reported success under read-only mode")
 	}
@@ -214,7 +215,7 @@ func TestReadOnlyBlocksExecutor(t *testing.T) {
 
 	var sawError bool
 	var exitCode int
-	exec.ExecuteStream(ExecuteRequest{Command: "touch " + marker + "-stream"}, func(e StreamEvent) {
+	exec.ExecuteStream(context.Background(), ExecuteRequest{Command: "touch " + marker + "-stream"}, func(e StreamEvent) {
 		if e.Type == "error" {
 			sawError = true
 		}
@@ -316,7 +317,7 @@ func TestReadOnlyToolListsConsistent(t *testing.T) {
 // read-only accounting silently drifts from reality.
 func TestToolInventoryMatchesRegistrations(t *testing.T) {
 	registered := map[string]bool{}
-	for _, f := range []string{"mcp.go", "mcp_fileops.go", "mcp_system.go"} {
+	for _, f := range []string{"mcp.go", "mcp_fileops.go", "mcp_system.go", "mcp_jobs.go"} {
 		src, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
