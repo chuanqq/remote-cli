@@ -96,7 +96,7 @@ func TestRateLimitExemptsMCPStream(t *testing.T) {
 // ---- 3.13 auth ---------------------------------------------------------------
 
 func TestAuthConstantTime(t *testing.T) {
-	h := AuthMiddleware("secret-token", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	h := AuthMiddleware(newPlainAuth("secret-token"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	for _, c := range []struct {
 		hdr  string
 		want int
@@ -115,6 +115,97 @@ func TestAuthConstantTime(t *testing.T) {
 		if rec.Code != c.want {
 			t.Errorf("%q: %d, want %d", c.hdr, rec.Code, c.want)
 		}
+	}
+}
+
+// ---- 3.13b token hash (SHELL_API_TOKEN_HASH) ----------------------------------
+
+func TestParseTokenHash(t *testing.T) {
+	salt := strings.Repeat("ab", 8)  // 16 hex chars = 8 bytes
+	hash := strings.Repeat("cd", 32) // 64 hex chars = 32 bytes
+	if _, _, err := parseTokenHash("sha256:" + salt + ":" + hash); err != nil {
+		t.Fatalf("valid value rejected: %v", err)
+	}
+	for _, bad := range []string{
+		"",                         // empty
+		"sha256:abcd",              // too few fields
+		"sha256:ab:cd:ef",          // too many fields
+		"md5:" + salt + ":" + hash, // unknown algorithm
+		"sha256:zz:" + hash,        // salt not hex
+		"sha256:abcd:" + hash,      // salt too short (2 bytes)
+		"sha256:" + salt + ":zz",   // hash not hex
+		"sha256:" + salt + ":abcd", // hash wrong length
+	} {
+		if _, _, err := parseTokenHash(bad); err == nil {
+			t.Errorf("%q accepted, want error", bad)
+		}
+	}
+}
+
+func TestTokenHashRoundTrip(t *testing.T) {
+	stored := generateTokenHash("secret-token")
+	salt, want, err := parseTokenHash(stored)
+	if err != nil {
+		t.Fatalf("generated value does not parse: %v", err)
+	}
+	a := newHashAuth(salt, want)
+	if !a.verify("secret-token") {
+		t.Error("correct token rejected")
+	}
+	for _, wrong := range []string{"", "secret-toke", "secret-tokenX", "SECRET-TOKEN"} {
+		if a.verify(wrong) {
+			t.Errorf("wrong token %q accepted", wrong)
+		}
+	}
+	// Two generations of the same token must differ (random salt) — otherwise
+	// one deployment's digest would be a precomputed table for all of them.
+	if other := generateTokenHash("secret-token"); other == stored {
+		t.Error("salt not randomized between calls")
+	}
+}
+
+func TestAuthMiddlewareHashed(t *testing.T) {
+	salt, want, err := parseTokenHash(generateTokenHash("secret-token"))
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	h := AuthMiddleware(newHashAuth(salt, want), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	for _, c := range []struct {
+		hdr  string
+		want int
+	}{
+		{"Bearer secret-token", 200},
+		{"Bearer secret-tokenX", 401},
+		{"Bearer ", 401},
+		{"", 401},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		if c.hdr != "" {
+			req.Header.Set("Authorization", c.hdr)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("%q: %d, want %d", c.hdr, rec.Code, c.want)
+		}
+	}
+}
+
+func TestBuildTokenAuth(t *testing.T) {
+	if a, _, err := buildTokenAuth("t", ""); err != nil || a == nil {
+		t.Errorf("plain mode: err=%v", err)
+	}
+	if a, _, err := buildTokenAuth("", generateTokenHash("t")); err != nil || a == nil {
+		t.Errorf("hash mode: err=%v", err)
+	}
+	if _, _, err := buildTokenAuth("t", generateTokenHash("t")); err == nil {
+		t.Error("both set: want error")
+	}
+	if _, _, err := buildTokenAuth("", ""); err == nil {
+		t.Error("neither set: want error")
+	}
+	if _, _, err := buildTokenAuth("", "sha256:garbage"); err == nil {
+		t.Error("malformed hash: want error")
 	}
 }
 

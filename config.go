@@ -11,13 +11,17 @@ import (
 )
 
 type Config struct {
-	Port       string
-	Token      string
-	TLSCert    string
-	TLSKey     string
-	MaxTimeout int
-	MaxOutput  int
-	RateLimit  int
+	Port  string
+	Token string
+	// TokenHash, when set instead of Token, is "sha256$<salt-hex>$<hash-hex>"
+	// (hash = SHA-256(salt || token)): the server stores no plaintext
+	// credential. Mutually exclusive with Token; enforced at startup.
+	TokenHash   string
+	TLSCert     string
+	TLSKey      string
+	MaxTimeout  int
+	MaxOutput   int
+	RateLimit   int
 	// RateBurst is the token-bucket capacity per client host: how many
 	// requests may arrive back to back before the RateLimit/min refill rate
 	// takes over.
@@ -55,6 +59,7 @@ func LoadConfig() *Config {
 	cfg := &Config{
 		Port:          getEnv("SHELL_API_PORT", "8080"),
 		Token:         getEnv("SHELL_API_TOKEN", ""),
+		TokenHash:     getEnv("SHELL_API_TOKEN_HASH", ""),
 		TLSCert:       getEnv("SHELL_API_TLS_CERT", ""),
 		TLSKey:        getEnv("SHELL_API_TLS_KEY", ""),
 		MaxTimeout:    getEnvInt("SHELL_API_MAX_TIMEOUT", 300),

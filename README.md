@@ -47,6 +47,12 @@ go build -o remote-agent-proxy
 # 运行(最低要求:设置 Token)
 SHELL_API_TOKEN=your-secret-token ./remote-agent-proxy
 
+# 哈希模式(服务端不落明文 Token):客户端照旧发送明文 Bearer,
+# 服务端只存盐化 SHA-256,两者与 SHELL_API_TOKEN 二选一
+printf '%s' 'your-secret-token' | ./remote-agent-proxy hash-token
+# 输出形如 sha256:<salt-hex>:<hash-hex>,写入:
+SHELL_API_TOKEN_HASH=sha256:...:... ./remote-agent-proxy
+
 # 只读模式(一键):仅暴露读取能力,禁止任何修改
 SHELL_API_TOKEN=your-secret-token SHELL_API_READONLY=true ./remote-agent-proxy
 # 或用启动脚本
@@ -90,6 +96,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_READONLY` | (空) | **只读模式开关,优先级最高**。取 `1` / `true` / `yes` / `on` / `enabled` 开启;开启后所有写能力强制关闭,无法被其他配置覆盖 |
 | `SHELL_API_PORT` | `8080` | 监听端口 |
 | `SHELL_API_TOKEN` | (必填) | Bearer Token,客户端鉴权凭据 |
+| `SHELL_API_TOKEN_HASH` | (二选一) | Token 的盐化 SHA-256,格式 `sha256:<salt-hex>:<hash-hex>`(hash = SHA-256(salt ‖ token)),与 `SHELL_API_TOKEN` 互斥且必须恰好设置其一。服务端不落明文,客户端仍发送明文 Bearer。生成: `printf '%s' 'your-token' \| ./remote-agent-proxy hash-token` |
 | `SHELL_API_TLS_CERT` | (空) | TLS 证书路径,留空则监听明文 HTTP |
 | `SHELL_API_TLS_KEY` | (空) | TLS 私钥路径 |
 | `SHELL_API_MAX_TIMEOUT` | `300` | 单次命令超时上限(秒) |
@@ -530,8 +537,8 @@ SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-
 本服务在默认(读写)模式下,在网络边界上等同于一个交互式 shell,部署前请务必:
 
 1. **只需要读就开只读模式** 设 `SHELL_API_READONLY=true`,这是唯一能真正关闭全部写通路的开关,优先级高于其他一切配置
-2. **启用 TLS**,避免 Token 与命令内容在传输中泄露
-3. **使用强随机 Token**,不要硬编码进代码仓库
+2. **启用 TLS**,避免 Token 与命令内容在传输中泄露。注意哈希存储(`SHELL_API_TOKEN_HASH`)只保护服务端落盘的配置,客户端发送的仍是明文 Bearer,传输层的保护仍需 TLS
+3. **使用强随机 Token**,不要硬编码进代码仓库;并把 `SHELL_API_TOKEN` 换成 `SHELL_API_TOKEN_HASH`(盐化 SHA-256,`printf '%s' 'your-token' \| ./remote-agent-proxy hash-token` 生成),这样服务器上的 `.env` / `env.conf` / 环境变量泄露时攻击者拿到的只是哈希,既不能反推明文也不能直接登录。若坚持使用人类可记的弱口令,请知悉:泄露的哈希可被离线穷举,此时应改用 `openssl rand -hex 32` 生成的高熵 Token
 4. **设置 `FSRoot`** 把文件操作限制在指定目录,缩小爆炸半径;可传入多个目录前缀
 5. **按需启用工具黑名单** 用 `SHELL_API_DISABLED_TOOLS` 禁掉不需要的能力,遵循最小权限原则
 6. **不要暴露到公网**,应放在 VPN / 内网之后,或配合反向代理与额外鉴权

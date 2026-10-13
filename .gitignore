@@ -6,6 +6,8 @@
 /AGENTS.md
 *.exe
 /remote-agent-proxy
+# `go build ./...` drops the main binary here under the module name.
+/remote-cli
 /dist/
 /server
 # start.sh sources .env, which holds SHELL_API_TOKEN — never commit it.

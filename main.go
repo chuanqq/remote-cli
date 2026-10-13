@@ -19,6 +19,10 @@ func main() {
 		fmt.Println(versionBanner())
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "hash-token" {
+		runHashToken()
+		return
+	}
 
 	cfg := LoadConfig()
 
@@ -27,8 +31,11 @@ func main() {
 	logger := newLogger(os.Stderr, cfg.LogLevel)
 	slog.SetDefault(logger)
 
-	if cfg.Token == "" {
-		logger.Error("SHELL_API_TOKEN environment variable is required")
+	// Exactly one of SHELL_API_TOKEN / SHELL_API_TOKEN_HASH must be set; the
+	// former stores the plaintext, the latter only a salted digest.
+	auth, authMode, err := buildTokenAuth(cfg.Token, cfg.TokenHash)
+	if err != nil {
+		logger.Error("invalid auth configuration", "err", err.Error())
 		os.Exit(1)
 	}
 
@@ -86,7 +93,7 @@ func main() {
 	var handler http.Handler = mux
 	handler = drainStreamsMiddleware(streamsCtx, handler)
 	handler = ReadOnlyMiddleware(cfg.ReadOnly, handler)
-	handler = AuthMiddleware(cfg.Token, handler)
+	handler = AuthMiddleware(auth, handler)
 	handler = RateLimitMiddleware(rateLimiter, handler)
 	handler = LoggingMiddleware(logger, handler)
 
@@ -109,7 +116,7 @@ func main() {
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
 
-	logStartup(logger, cfg)
+	logStartup(logger, cfg, authMode)
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -186,13 +193,14 @@ func drainStreamsMiddleware(done context.Context, next http.Handler) http.Handle
 	})
 }
 
-func logStartup(logger *slog.Logger, cfg *Config) {
+func logStartup(logger *slog.Logger, cfg *Config, authMode string) {
 	attrs := []any{
 		"version", serverVersion,
 		"commit", gitCommit,
 		"build_time", buildTime,
 		"addr", ":" + cfg.Port,
 		"tls", cfg.TLSCert != "",
+		"auth_mode", authMode,
 		"max_timeout_sec", cfg.MaxTimeout,
 		"max_output", cfg.MaxOutput,
 		"rate_limit_per_min", cfg.RateLimit,

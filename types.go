@@ -8,7 +8,7 @@ import "fmt"
 // -X main.buildTime=...". They must stay package-level vars (not consts) for
 // -X to take effect.
 var (
-	serverVersion = "1.1.0"
+	serverVersion = "1.3.0"
 	gitCommit     = "unknown"
 	buildTime     = "unknown"
 )

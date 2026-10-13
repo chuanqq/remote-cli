@@ -35,6 +35,7 @@ LOG_FILE="${SCRIPT_DIR}/remote-agent-proxy.log"
 # ──────────────────────────────────────────────
 : "${SHELL_API_PORT:=8080}"
 : "${SHELL_API_TOKEN:=}"
+: "${SHELL_API_TOKEN_HASH:=}"
 : "${SHELL_API_MAX_TIMEOUT:=300}"
 : "${SHELL_API_MAX_OUTPUT:=1048576}"
 : "${SHELL_API_RATE_LIMIT:=120}"
@@ -129,10 +130,17 @@ cmd_start() {
         cmd_build
     fi
 
-    # 自动生成 Token（如果未设置）
-    if [[ -z "${SHELL_API_TOKEN}" ]]; then
+    # 鉴权互斥检查：服务端会 fatal，这里提前报错提示更友好
+    if [[ -n "${SHELL_API_TOKEN}" && -n "${SHELL_API_TOKEN_HASH}" ]]; then
+        log_error "SHELL_API_TOKEN 与 SHELL_API_TOKEN_HASH 互斥，只能设置其中一个"
+        exit 1
+    fi
+
+    # 自动生成 Token（如果 Token 与 Token Hash 都未设置；哈希模式无法自动
+    # 生成——明文必须由用户持有并配置到客户端）
+    if [[ -z "${SHELL_API_TOKEN}" && -z "${SHELL_API_TOKEN_HASH}" ]]; then
         SHELL_API_TOKEN=$(generate_token)
-        log_warn "未设置 SHELL_API_TOKEN，已自动生成随机 Token"
+        log_warn "未设置 SHELL_API_TOKEN / SHELL_API_TOKEN_HASH，已自动生成随机 Token"
         echo "  Token: ${SHELL_API_TOKEN}"
         echo "  请保存此 Token，下次启动时可通过环境变量或 .env 文件指定"
     fi
@@ -140,6 +148,7 @@ cmd_start() {
     # 导出环境变量
     export SHELL_API_PORT
     export SHELL_API_TOKEN
+    export SHELL_API_TOKEN_HASH
     export SHELL_API_MAX_TIMEOUT
     export SHELL_API_MAX_OUTPUT
     export SHELL_API_RATE_LIMIT
@@ -160,6 +169,11 @@ cmd_start() {
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  端口:      ${SHELL_API_PORT}"
     echo "  协议:      HTTP（明文，未启用 TLS）"
+    if [[ -n "${SHELL_API_TOKEN_HASH}" ]]; then
+        echo -e "  鉴权:      ${CYAN}哈希模式（盐化 SHA-256，服务端不存明文 Token）${NC}"
+    else
+        echo "  鉴权:      明文 Token 模式"
+    fi
     if is_readonly; then
         echo -e "  运行模式:  ${CYAN}只读（READ-ONLY，最高优先级）${NC}"
         echo "             仅保留 11 个只读工具；命令执行 / 写 / 编辑 / 删除 / 移动 / 复制 / 建目录 全部关闭"
@@ -195,13 +209,16 @@ cmd_start() {
     if kill -0 "${pid}" 2>/dev/null; then
         log_info "服务启动成功 (PID: ${pid})"
         echo ""
+        # 哈希模式下脚本不知道明文 Token，示例命令用占位符提示用户替换
+        local bearer="${SHELL_API_TOKEN}"
+        [[ -n "${bearer}" ]] || bearer="<你的明文 Token>"
         echo -e "${CYAN}快速验证:${NC}"
         echo "  curl http://localhost:${SHELL_API_PORT}/api/status"
         echo ""
         if is_readonly; then
             echo -e "${CYAN}只读模式校验（应返回 403 read_only_mode）:${NC}"
             echo "  curl -i -X POST http://localhost:${SHELL_API_PORT}/api/execute \\"
-            echo "    -H \"Authorization: Bearer ${SHELL_API_TOKEN}\" \\"
+            echo "    -H \"Authorization: Bearer ${bearer}\" \\"
             echo "    -H \"Content-Type: application/json\" \\"
             echo "    -d '{\"command\":\"id\"}'"
             echo ""
@@ -210,7 +227,7 @@ cmd_start() {
         else
             echo -e "${CYAN}执行命令:${NC}"
             echo "  curl -X POST http://localhost:${SHELL_API_PORT}/api/execute \\"
-            echo "    -H \"Authorization: Bearer ${SHELL_API_TOKEN}\" \\"
+            echo "    -H \"Authorization: Bearer ${bearer}\" \\"
             echo "    -H \"Content-Type: application/json\" \\"
             echo "    -d '{\"command\":\"uname -a\"}'"
         fi
@@ -312,17 +329,18 @@ cmd_status() {
 
     echo -e "${GREEN}状态: 运行中${NC}"
     echo "  PID:       ${pid}"
-    # 尝试获取端口
+    # 实际监听端口。lsof 的 -p 与 -i 默认取并集，必须加 -a 取交集，否则会
+    # 列出机器上所有监听进程（-P -n 禁用服务名/主机名解析）。探测不到时
+    # 回退到配置值，健康检查也用它。
+    local port=""
     if command -v lsof &>/dev/null; then
-        local port
-        port=$(lsof -p "${pid}" -i TCP -s TCP:LISTEN -Fn 2>/dev/null | grep -o '[0-9]*$' | head -1 || true)
-        if [[ -n "${port}" ]]; then
-            echo "  端口:      ${port}"
-        fi
+        port=$(lsof -a -P -n -p "${pid}" -i TCP -s TCP:LISTEN -Fn 2>/dev/null \
+               | sed -nE 's/^n.*:([0-9]+)$/\1/p' | head -1 || true)
     fi
+    [[ -n "${port}" ]] || port="${SHELL_API_PORT:-unknown}"
+    echo "  端口:      ${port}"
 
     # 尝试健康检查（顺带读出服务端自报的运行模式，这是权威来源）
-    local port="${SHELL_API_PORT:-8080}"
     if command -v curl &>/dev/null; then
         local body resp
         body=$(curl -s "http://localhost:${port}/api/status" 2>/dev/null || true)
@@ -352,14 +370,21 @@ cmd_foreground() {
         cmd_build
     fi
 
-    # 自动生成 Token
-    if [[ -z "${SHELL_API_TOKEN}" ]]; then
+    # 鉴权互斥检查（与 cmd_start 一致）
+    if [[ -n "${SHELL_API_TOKEN}" && -n "${SHELL_API_TOKEN_HASH}" ]]; then
+        log_error "SHELL_API_TOKEN 与 SHELL_API_TOKEN_HASH 互斥，只能设置其中一个"
+        exit 1
+    fi
+
+    # 自动生成 Token（两者都未设置时；哈希模式无法自动生成）
+    if [[ -z "${SHELL_API_TOKEN}" && -z "${SHELL_API_TOKEN_HASH}" ]]; then
         SHELL_API_TOKEN=$(generate_token)
-        log_warn "未设置 SHELL_API_TOKEN，已自动生成随机 Token: ${SHELL_API_TOKEN}"
+        log_warn "未设置 SHELL_API_TOKEN / SHELL_API_TOKEN_HASH，已自动生成随机 Token: ${SHELL_API_TOKEN}"
     fi
 
     export SHELL_API_PORT
     export SHELL_API_TOKEN
+    export SHELL_API_TOKEN_HASH
     export SHELL_API_MAX_TIMEOUT
     export SHELL_API_MAX_OUTPUT
     export SHELL_API_RATE_LIMIT
@@ -390,13 +415,21 @@ cmd_foreground_readonly() {
 # 命令: token  显示当前 Token
 # ──────────────────────────────────────────────
 cmd_token() {
-    if [[ -z "${SHELL_API_TOKEN}" ]]; then
-        log_error "SHELL_API_TOKEN 未设置"
-        echo "  请设置环境变量: export SHELL_API_TOKEN=your-token"
-        echo "  或在 .env 文件中添加: SHELL_API_TOKEN=your-token"
-        exit 1
+    if [[ -n "${SHELL_API_TOKEN}" ]]; then
+        echo "当前 Token: ${SHELL_API_TOKEN}"
+        return 0
     fi
-    echo "当前 Token: ${SHELL_API_TOKEN}"
+    if [[ -n "${SHELL_API_TOKEN_HASH}" ]]; then
+        echo "当前为哈希模式（服务端只存盐化 SHA-256，无明文可显示）"
+        echo "  Token Hash: ${SHELL_API_TOKEN_HASH}"
+        echo "  明文 Token 仅客户端持有；重置时生成新哈希更新 SHELL_API_TOKEN_HASH 即可"
+        return 0
+    fi
+    log_error "SHELL_API_TOKEN / SHELL_API_TOKEN_HASH 均未设置"
+    echo "  请设置环境变量: export SHELL_API_TOKEN=your-token"
+    echo "  或在 .env 文件中添加: SHELL_API_TOKEN=your-token"
+    echo "  或使用哈希模式: printf '%s' 'your-token' | ./remote-agent-proxy hash-token"
+    exit 1
 }
 
 # ──────────────────────────────────────────────
@@ -411,8 +444,12 @@ cmd_readonly_check() {
         log_error "需要 curl 才能执行校验"
         exit 1
     fi
-    if [[ -z "${SHELL_API_TOKEN}" ]]; then
-        log_error "SHELL_API_TOKEN 未设置，无法调用受鉴权的端点"
+    # 校验需要调用受鉴权的端点，因此必须有明文 Token。明文模式直接用
+    # SHELL_API_TOKEN；哈希模式（服务端只有哈希）需通过 CHECK_TOKEN 传入。
+    : "${CHECK_TOKEN:=${SHELL_API_TOKEN}}"
+    if [[ -z "${CHECK_TOKEN}" ]]; then
+        log_error "未设置明文 Token，无法调用受鉴权的端点"
+        echo "  哈希模式（SHELL_API_TOKEN_HASH）下请传入: CHECK_TOKEN=your-token $0 readonly-check"
         exit 1
     fi
 
@@ -432,7 +469,7 @@ cmd_readonly_check() {
     local code
     for path in "/api/execute" "/api/execute/stream" "/api/sessions"; do
         code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${base}${path}" \
-            -H "Authorization: Bearer ${SHELL_API_TOKEN}" \
+            -H "Authorization: Bearer ${CHECK_TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{"command":"id"}' 2>/dev/null || true)
         if [[ "${code}" == "403" ]]; then
@@ -449,7 +486,7 @@ cmd_readonly_check() {
     local hdr_file tools sid
     hdr_file=$(mktemp)
     curl -s -D "${hdr_file}" -o /dev/null -X POST "${base}/mcp" \
-        -H "Authorization: Bearer ${SHELL_API_TOKEN}" \
+        -H "Authorization: Bearer ${CHECK_TOKEN}" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
         -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"readonly-check","version":"1"}}}' \
@@ -462,7 +499,7 @@ cmd_readonly_check() {
         ((failures++))
     else
         tools=$(curl -s -X POST "${base}/mcp" \
-            -H "Authorization: Bearer ${SHELL_API_TOKEN}" \
+            -H "Authorization: Bearer ${CHECK_TOKEN}" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json, text/event-stream" \
             -H "Mcp-Session-Id: ${sid}" \
@@ -559,6 +596,8 @@ case "${1:-}" in
         echo "  SHELL_API_READONLY     只读模式开关，1/true/yes/on/enabled 开启（优先级最高）"
         echo "  SHELL_API_PORT         监听端口（默认: 8080）"
         echo "  SHELL_API_TOKEN        Bearer Token（必填，未设置时会自动生成）"
+        echo "  SHELL_API_TOKEN_HASH   Token 的盐化 SHA-256（sha256:盐:哈希），与 SHELL_API_TOKEN 二选一，"
+        echo "                         服务端不落明文。生成: printf '%s' 'your-token' | ./remote-agent-proxy hash-token"
         echo "  SHELL_API_MAX_TIMEOUT  命令超时上限秒数（默认: 300）"
         echo "  SHELL_API_MAX_OUTPUT   输出字节上限（默认: 1048576）"
         echo "  SHELL_API_RATE_LIMIT   每客户端 IP 每分钟请求补充速率（默认: 120）"
