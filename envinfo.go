@@ -51,6 +51,11 @@ type ServerProfile struct {
 	MaxOutput     int      `json:"max_output"`
 	RateLimit     int      `json:"rate_limit"`
 	RateBurst     int      `json:"rate_burst"`
+	// CallBudgetSec is the longest one MCP tool call blocks; longer work
+	// returns an execution_id / wait_id to resume.
+	CallBudgetSec int `json:"call_budget_sec"`
+	// MaxWaitSec is the longest a remote_wait_for watcher may run.
+	MaxWaitSec int `json:"max_wait_sec"`
 	// DenyCommands is the effective command deny regex (jump-host blocking
 	// and/or operator patterns); empty when nothing is denied.
 	DenyCommands string `json:"deny_commands,omitempty"`
@@ -128,6 +133,8 @@ func GetEnvInfo(cfg *Config) *EnvInfoResult {
 			MaxOutput:     cfg.MaxOutput,
 			RateLimit:     cfg.RateLimit,
 			RateBurst:     cfg.RateBurst,
+			CallBudgetSec: cfg.callBudgetSec(),
+			MaxWaitSec:    maxWaitTimeoutSec,
 			DenyCommands:  denyString(cfg),
 			Note: "This is the REMOTE host " + hostname + ": paths, working directories and commands are " +
 				"resolved here, not on the client machine.",

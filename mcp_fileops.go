@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strings"
 
@@ -50,7 +51,7 @@ func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFi
 		return
 	}
 	s.AddTool(mcp.NewTool("remote_write_file",
-		mcp.WithDescription("Write UTF-8 text content to a file on the remote server. Supports target encoding conversion (utf-8/gbk/gb2312/gb18030), append mode, and auto-creating parent directories. For binary data use remote_upload_base64. Do NOT fall back to shell `echo ... > file` or heredocs: this tool returns sha256/mode for verification and can lint the result (bash -n / py_compile)."),
+		mcp.WithDescription("Write UTF-8 text content to a file on the remote server. Supports target encoding conversion (utf-8/gbk/gb2312/gb18030), append mode, and auto-creating parent directories. For binary data use remote_upload_base64. Do NOT fall back to shell `echo ... > file` or heredocs: this tool returns sha256/mode for verification and can lint the result (bash -n / py_compile). Use dry_run=true to preview an overwrite of a config file: nothing is written and preview.diff shows the unified diff against the current content."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute or relative file path on the remote server.")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("UTF-8 text content to write.")),
 		mcp.WithString("encoding", mcp.Description("On-disk encoding: utf-8 (default), gbk, gb2312, gb18030."), mcp.Enum("utf-8", "gbk", "gb2312", "gb18030")),
@@ -58,12 +59,18 @@ func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFi
 		mcp.WithBoolean("make_dirs", mcp.Description("Create parent directories if missing. Default false.")),
 		mcp.WithString("mode", mcp.Description("Octal permission for newly created files, e.g. \"0644\". Default 0644.")),
 		mcp.WithString("lint", mcp.Description("Post-write syntax check: \"bash\" (bash -n) or \"python\" (py_compile). Result is advisory and returned in the response."), mcp.Enum("bash", "python", "none")),
+		mcp.WithBoolean("dry_run", mcp.Description("Write nothing; report what the write would do (bytes, sha256, created, mode) plus preview.diff against the current content. Default false.")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		path := req.GetString("path", "")
 		if path == "" {
 			return mcp.NewToolResultError("path is required"), nil
 		}
 		content := req.GetString("content", "")
+		dryRun := req.GetBool("dry_run", false)
+		op := "write_file"
+		if dryRun {
+			op = "write_file(dry_run)"
+		}
 
 		result, err := WriteFileContent(WriteFileRequest{
 			Path:     path,
@@ -73,12 +80,13 @@ func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFi
 			MakeDirs: req.GetBool("make_dirs", false),
 			Mode:     req.GetString("mode", ""),
 			Lint:     req.GetString("lint", ""),
+			DryRun:   dryRun,
 		}, roots)
 		if err != nil {
-			auditFileOp(ctx, "write_file", path, false, 0, false)
+			auditFileOp(ctx, op, path, false, 0, false)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		auditFileOp(ctx, "write_file", result.Path, true, result.BytesWritten, false)
+		auditFileOp(ctx, op, result.Path, true, result.BytesWritten, false)
 		return jsonResult(result), nil
 	})
 }
@@ -393,7 +401,7 @@ func registerTailLogTool(s *server.MCPServer, cfg *Config, roots []string, audit
 		mcp.WithString("filter_regex", mcp.Description("RE2: return only matching lines, e.g. \"FATAL|ERROR\". Cursors still advance past non-matching lines.")),
 		mcp.WithNumber("since_line", mcp.Description("Line cursor: return lines after this 1-based line number (use end_line of the previous response).")),
 		mcp.WithNumber("since_offset", mcp.Description("Byte cursor: return content after this offset (use end_offset of the previous response). Wins over since_line.")),
-		mcp.WithNumber("follow_seconds", mcp.Description("Wait up to N seconds (max 300) for new content before returning; timed_out=true when nothing arrived.")),
+		mcp.WithNumber("follow_seconds", mcp.Description(fmt.Sprintf("Wait up to N seconds (max %d, the call budget) for new content before returning; timed_out=true when nothing arrived — call again with since_offset=end_offset to keep following. To wait for a specific line use remote_wait_for(condition=log_regex).", cfg.callBudgetSec()))),
 		mcp.WithString("encoding", mcp.Description("Source encoding; auto-detected if omitted."), mcp.Enum("utf-8", "gbk", "gb2312", "gb18030")),
 		mcp.WithNumber("max_bytes", mcp.Description("Cap on collected content bytes. Default 1MB.")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -402,13 +410,17 @@ func registerTailLogTool(s *server.MCPServer, cfg *Config, roots []string, audit
 			return mcp.NewToolResultError("path is required"), nil
 		}
 
+		follow := req.GetInt("follow_seconds", 0)
+		if max := cfg.callBudgetSec(); follow > max {
+			follow = max // a longer follow would outlive the client's request
+		}
 		result, err := TailLog(TailLogRequest{
 			Path:          path,
 			Lines:         req.GetInt("lines", 0),
 			FilterRegex:   req.GetString("filter_regex", ""),
 			SinceLine:     req.GetInt("since_line", 0),
 			SinceOffset:   int64(req.GetInt("since_offset", 0)),
-			FollowSeconds: req.GetInt("follow_seconds", 0),
+			FollowSeconds: follow,
 			Encoding:      req.GetString("encoding", ""),
 			MaxBytes:      req.GetInt("max_bytes", 0),
 		}, roots)

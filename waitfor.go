@@ -23,13 +23,15 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	defaultWaitTimeoutSec = 60
-	maxWaitTimeoutSec     = 300
-	defaultWaitInterval   = time.Second
-	minWaitInterval       = 200 * time.Millisecond
-	maxWaitScanBytes      = 64 << 20 // file_contains scans at most this much
-	maxWaitMatchLen       = 2000
-	waitProbeTimeoutMs    = 10000 // per-probe timeout for command_exit0
+	defaultWaitTimeoutSec  = 60
+	maxWaitTimeoutSec      = 24 * 3600 // a wait outlives calls: see waits.go
+	defaultWaitInterval    = time.Second
+	minWaitInterval        = 200 * time.Millisecond
+	minCommandWaitInterval = time.Second
+	maxWaitScanBytes       = 64 << 20 // one scan reads at most this much
+	maxWaitLineBytes       = 1 << 20  // longer lines are matched on their head
+	maxWaitMatchLen        = 2000
+	waitProbeTimeoutMs     = 10000 // per-probe timeout for command_exit0
 )
 
 // Supported conditions.
@@ -64,6 +66,14 @@ type WaitForResult struct {
 	Detail string `json:"detail,omitempty"`
 	// Output is the last probe's stdout+stderr for command_exit0.
 	Output string `json:"output,omitempty"`
+
+	// Set by the MCP tool (waits.go): the server-side watcher id, its state
+	// (satisfied / timed_out / pending / cancelled), when it gives up, and
+	// what to do next.
+	WaitID    string `json:"wait_id,omitempty"`
+	State     string `json:"state,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	Hint      string `json:"hint,omitempty"`
 }
 
 type waitDeps struct {
@@ -76,7 +86,20 @@ type waitDeps struct {
 // is permanent (bad target) and aborts the wait.
 type probe func(ctx context.Context) (bool, string, error)
 
-func WaitFor(ctx context.Context, req WaitForRequest, deps waitDeps) (*WaitForResult, error) {
+// errWaitCancelled ends a wait stopped by its caller before it resolved.
+var errWaitCancelled = errors.New("wait cancelled")
+
+// waitPlan is a validated wait, ready to run.
+type waitPlan struct {
+	check    probe
+	res      *WaitForResult
+	timeout  time.Duration
+	interval time.Duration
+}
+
+// planWait validates req and builds its probe. Errors (bad target, pattern,
+// sandbox) are reported here, before anything waits.
+func planWait(req WaitForRequest, deps waitDeps) (*waitPlan, error) {
 	timeout := req.TimeoutSec
 	if timeout <= 0 {
 		timeout = defaultWaitTimeoutSec
@@ -91,6 +114,10 @@ func WaitFor(ctx context.Context, req WaitForRequest, deps waitDeps) (*WaitForRe
 	if interval < minWaitInterval {
 		interval = minWaitInterval
 	}
+	if req.Condition == WaitCommandExit0 && interval < minCommandWaitInterval {
+		// Each check spawns a shell, and a watcher may now run for hours.
+		interval = minCommandWaitInterval
+	}
 	if strings.TrimSpace(req.Target) == "" {
 		return nil, errors.New("target is required")
 	}
@@ -100,24 +127,43 @@ func WaitFor(ctx context.Context, req WaitForRequest, deps waitDeps) (*WaitForRe
 	if err != nil {
 		return nil, err
 	}
+	return &waitPlan{check: check, res: res, timeout: time.Duration(timeout) * time.Second, interval: interval}, nil
+}
 
+// WaitFor blocks until the condition holds, the timeout passes or ctx ends.
+func WaitFor(ctx context.Context, req WaitForRequest, deps waitDeps) (*WaitForResult, error) {
+	p, err := planWait(req, deps)
+	if err != nil {
+		return nil, err
+	}
+	return p.run(ctx, nil)
+}
+
+// run polls until the condition holds or the timeout passes. observe, if
+// set, receives a snapshot after every check. A ctx cancelled by the caller
+// returns the last state with errWaitCancelled.
+func (p *waitPlan) run(ctx context.Context, observe func(WaitForResult)) (*WaitForResult, error) {
+	res := p.res
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for {
-		ok, detail, err := check(ctx)
+		ok, detail, err := p.check(ctx)
 		res.Checks++
 		res.Detail = detail
+		res.WaitedMs = time.Since(start).Milliseconds()
 		if err != nil {
 			return nil, err
 		}
 		if ok {
 			res.Satisfied = true
-			res.WaitedMs = time.Since(start).Milliseconds()
 			return res, nil
+		}
+		if observe != nil {
+			observe(*res)
 		}
 		select {
 		case <-ctx.Done():
@@ -126,7 +172,7 @@ func WaitFor(ctx context.Context, req WaitForRequest, deps waitDeps) (*WaitForRe
 				res.TimedOut = true
 				return res, nil
 			}
-			return res, errors.New("wait cancelled")
+			return res, errWaitCancelled
 		case <-ticker.C:
 		}
 	}
@@ -170,14 +216,30 @@ func buildProbe(req WaitForRequest, deps waitDeps, res *WaitForResult) (probe, e
 		if err != nil {
 			return nil, err
 		}
+		// A watcher may poll for hours: skip the rescan while the file has
+		// provably not changed since the last one — same inode, size and
+		// mtime, where the mtime was already 2s old when that scan ran, so a
+		// later write cannot share it even on filesystems with coarse mtimes.
+		var scanned os.FileInfo
+		var scannedAt time.Time
 		return func(context.Context) (bool, string, error) {
-			line, n, found, err := scanFileForMatch(abs, 0, re, req.Encoding)
+			fi, err := os.Stat(abs)
+			if err != nil {
+				return false, "not present", nil
+			}
+			if scanned != nil && os.SameFile(fi, scanned) && fi.Size() == scanned.Size() &&
+				fi.ModTime().Equal(scanned.ModTime()) && scannedAt.Sub(fi.ModTime()) > 2*time.Second {
+				return false, "no match yet (file unchanged)", nil
+			}
+			at := time.Now()
+			line, n, found, _, err := scanFileForMatch(abs, 0, re, req.Encoding)
 			if err != nil {
 				return false, err.Error(), nil
 			}
 			if found {
 				return true, fmt.Sprintf("line %d: %s", n, line), nil
 			}
+			scanned, scannedAt = fi, at
 			return false, "no match yet", nil
 		}, nil
 
@@ -190,27 +252,34 @@ func buildProbe(req WaitForRequest, deps waitDeps, res *WaitForResult) (probe, e
 		if err != nil {
 			return nil, err
 		}
-		// Only content appended after the call started counts.
+		// Only content appended after the wait started counts. The cursor
+		// advances over every complete line scanned, so each appended byte is
+		// read once however long the watcher runs (an earlier version
+		// rescanned from the start offset every check, capped at 64MB: a log
+		// growing faster than that during a long wait hid later matches).
 		var offset int64
+		var seen os.FileInfo
 		if fi, err := os.Stat(abs); err == nil {
-			offset = fi.Size()
+			offset, seen = fi.Size(), fi
 		}
 		return func(context.Context) (bool, string, error) {
 			fi, err := os.Stat(abs)
 			if err != nil {
 				return false, "log not present", nil
 			}
-			if fi.Size() < offset {
-				offset = 0 // rotated / truncated: start over
+			if fi.Size() < offset || (seen != nil && !os.SameFile(fi, seen)) {
+				offset = 0 // truncated, or rotated to a new file: start over
 			}
-			line, _, found, err := scanFileForMatch(abs, offset, re, req.Encoding)
+			seen = fi
+			line, _, found, consumed, err := scanFileForMatch(abs, offset, re, req.Encoding)
 			if err != nil {
 				return false, err.Error(), nil
 			}
 			if found {
 				return true, line, nil
 			}
-			return false, fmt.Sprintf("no new matching line (scanned from offset %d)", offset), nil
+			offset += consumed
+			return false, fmt.Sprintf("no new matching line (scanned up to offset %d)", offset), nil
 		}, nil
 
 	case WaitProcessExit:
@@ -283,34 +352,63 @@ func buildProbe(req WaitForRequest, deps waitDeps, res *WaitForResult) (probe, e
 		WaitFileExists, WaitFileContains, WaitLogRegex, WaitProcessExit, WaitPortListen, WaitCommandExit0)
 }
 
-// scanFileForMatch scans path from offset line by line and returns the first
-// line matching re, its 1-based line number relative to offset, and whether
-// one was found. At most maxWaitScanBytes are read.
-func scanFileForMatch(path string, offset int64, re *regexp.Regexp, encoding string) (string, int, bool, error) {
+// scanFileForMatch scans path from offset line by line. It returns the first
+// line matching re (truncated for display), its 1-based number relative to
+// offset, whether one was found, and how many bytes of complete lines it
+// scanned without a match: the caller's next offset, so successive scans of a
+// growing file read each byte once, and a half-written last line is read
+// again once complete. One call reads at most maxWaitScanBytes; lines longer
+// than maxWaitLineBytes are matched on their first maxWaitLineBytes.
+func scanFileForMatch(path string, offset int64, re *regexp.Regexp, encoding string) (string, int, bool, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, false, 0, err
 	}
 	defer f.Close()
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return "", 0, false, err
+			return "", 0, false, 0, err
 		}
 	}
-	sc := bufio.NewScanner(io.LimitReader(f, maxWaitScanBytes))
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	br := bufio.NewReaderSize(io.LimitReader(f, maxWaitScanBytes), maxWaitLineBytes)
+	var consumed, total int64
+	var head []byte   // first maxWaitLineBytes of the current line
+	var lineLen int64 // full length of the current line so far
 	n := 0
-	for sc.Scan() {
-		n++
-		line := sc.Text()
-		if encoding != "" {
-			if dec, err := decodeToUTF8([]byte(line), encoding); err == nil {
-				line = dec
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if room := maxWaitLineBytes - len(head); room > 0 {
+			head = append(head, chunk[:min(len(chunk), room)]...)
+		}
+		lineLen += int64(len(chunk))
+		total += int64(len(chunk))
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue // over-long line: consume the rest of it
+		}
+		if lineLen > 0 {
+			n++
+			line := strings.TrimRight(string(head), "\r\n")
+			if encoding != "" {
+				if dec, decErr := decodeToUTF8([]byte(line), encoding); decErr == nil {
+					line = dec
+				}
+			}
+			if re.MatchString(line) {
+				return truncateString(line, maxWaitMatchLen), n, true, consumed + lineLen, nil
+			}
+			if err == nil { // ReadSlice found the newline: the line is complete
+				consumed += lineLen
 			}
 		}
-		if re.MatchString(line) {
-			return truncateString(line, maxWaitMatchLen), n, true, nil
+		head, lineLen = head[:0], 0
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return "", n, false, consumed, err
+			}
+			if consumed == 0 && total >= maxWaitScanBytes {
+				consumed = total // one line fills the whole read cap: skip it
+			}
+			return "", n, false, consumed, nil
 		}
 	}
-	return "", n, false, sc.Err()
 }

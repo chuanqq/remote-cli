@@ -42,6 +42,7 @@ func main() {
 	executor := NewExecutor(cfg)
 	sessions := NewSessionManager()
 	jobs := NewJobManager(cfg)
+	waits := NewWaitManager()
 	audit := NewAuditLogger(logger)
 
 	executeHandler := NewExecuteHandler(executor, audit)
@@ -76,7 +77,7 @@ func main() {
 	}
 
 	mux.HandleFunc("/api/status", statusHandler.Handle)
-	mux.Handle("/mcp", NewMCPHandler(executor, sessions, jobs, audit, cfg))
+	mux.Handle("/mcp", NewMCPHandler(executor, sessions, jobs, waits, audit, cfg))
 
 	rateLimiter := NewRateLimiter(cfg.RateLimit, cfg.RateBurst)
 
@@ -142,23 +143,35 @@ func main() {
 	}
 	stopSignals() // a second signal now terminates immediately
 
-	gracefulShutdown(logger, srv, executor, jobs, endStreams, cancelBase, cfg.ShutdownGrace)
+	gracefulShutdown(logger, srv, executor, jobs, waits, endStreams, cancelBase, cfg.ShutdownGrace)
 }
 
 // gracefulShutdown stops accepting connections, lets in-flight executions
-// finish for up to grace, then kills what is left (their whole process groups)
-// and closes the server. Background jobs from remote_spawn run in their own
-// sessions and are deliberately left running.
-func gracefulShutdown(logger *slog.Logger, srv *http.Server, executor *Executor, jobs *JobManager,
+// (including commands that outlived their MCP call) finish for up to grace,
+// then kills what is left (their whole process groups) and closes the server.
+// Background jobs from remote_spawn run in their own sessions and are
+// deliberately left running.
+func gracefulShutdown(logger *slog.Logger, srv *http.Server, executor *Executor, jobs *JobManager, waits *WaitManager,
 	endStreams, cancelBase context.CancelFunc, grace time.Duration) {
 	logger.Info("shutdown: signal received, draining",
 		"running_executions", executor.Running(), "grace_sec", int(grace.Seconds()))
 	endStreams()
+	// Watchers only observe; stopping them first also ends pending
+	// remote_wait_for calls (state=cancelled) instead of holding Shutdown.
+	if n := waits.CancelAll(); n > 0 {
+		logger.Info("shutdown: cancelled active waits", "waits", n)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	err := srv.Shutdown(ctx)
-	if err != nil {
+	// Commands that outlived their MCP call (executions.go) belong to no
+	// request, so Shutdown does not wait for them: they get the rest of the
+	// grace period as well.
+	for err == nil && executor.Running() > 0 && ctx.Err() == nil {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil || executor.Running() > 0 {
 		n := executor.CancelAll()
 		cancelBase()
 		// Give the killed calls' handlers a moment to write their audit
@@ -205,6 +218,7 @@ func logStartup(logger *slog.Logger, cfg *Config, authMode string) {
 		"max_output", cfg.MaxOutput,
 		"rate_limit_per_min", cfg.RateLimit,
 		"rate_burst", cfg.RateBurst,
+		"call_budget_sec", cfg.callBudgetSec(),
 		"mcp_heartbeat_sec", int(cfg.MCPHeartbeat.Seconds()),
 		"job_dir", cfg.JobDir,
 		"log_level", cfg.LogLevel,

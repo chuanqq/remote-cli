@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -77,11 +76,11 @@ func registerSessionTools(s *server.MCPServer, sessions *SessionManager, cfg *Co
 
 	if cfg.toolEnabled("remote_session_create") {
 		s.AddTool(mcp.NewTool("remote_session_create",
-			mcp.WithDescription("Create a persistent session on the remote server (working directory + env + shell, TTL-bound). Use the returned session_id with remote_session_execute: a successful bare `cd <dir>` persists the session cwd, avoiding repeated `cd X && ...` prefixes."),
+			mcp.WithDescription("Create a persistent session on the remote server (working directory + env + shell). Use the returned session_id with remote_session_execute: a successful bare `cd <dir>` persists the session cwd, avoiding repeated `cd X && ...` prefixes. ttl_seconds is an IDLE timeout: every remote_session_execute renews expires_at to now + ttl (returned as session_expires_at), so a session in regular use does not expire mid-task; an expired session is gone together with its cwd/env."),
 			mcp.WithString("working_directory", mcp.Description("Initial working directory. Defaults to the server user's home.")),
 			mcp.WithString("shell", mcp.Description("Shell binary. Default bash.")),
 			mcp.WithObject("environment", mcp.Description("Environment variables persisted for the session, as key-value pairs.")),
-			mcp.WithNumber("ttl_seconds", mcp.Description("Session TTL. Default 3600, max 86400.")),
+			mcp.WithNumber("ttl_seconds", mcp.Description("Idle timeout in seconds, renewed by every execute. Default 3600, max 86400.")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			sess := sessions.Create(SessionCreateRequest{
 				WorkingDirectory: req.GetString("working_directory", ""),
@@ -90,13 +89,7 @@ func registerSessionTools(s *server.MCPServer, sessions *SessionManager, cfg *Co
 				TTLSeconds:       req.GetInt("ttl_seconds", 0),
 			})
 			auditCall(ctx, sess.ID, "session_create "+sess.ID)
-			return jsonResult(SessionResponse{
-				SessionID:        sess.ID,
-				WorkingDirectory: sess.Cwd(),
-				CreatedAt:        sess.CreatedAt.Format(time.RFC3339),
-				ExpiresAt:        sess.ExpiresAt.Format(time.RFC3339),
-				Shell:            sess.Shell,
-			}), nil
+			return jsonResult(sessionResponse(sess)), nil
 		})
 	}
 
@@ -107,13 +100,7 @@ func registerSessionTools(s *server.MCPServer, sessions *SessionManager, cfg *Co
 			list := sessions.List()
 			sessionsOut := make([]SessionResponse, 0, len(list))
 			for _, sess := range list {
-				sessionsOut = append(sessionsOut, SessionResponse{
-					SessionID:        sess.ID,
-					WorkingDirectory: sess.Cwd(),
-					CreatedAt:        sess.CreatedAt.Format(time.RFC3339),
-					ExpiresAt:        sess.ExpiresAt.Format(time.RFC3339),
-					Shell:            sess.Shell,
-				})
+				sessionsOut = append(sessionsOut, sessionResponse(sess))
 			}
 			auditCall(ctx, "", "session_list")
 			return jsonResult(struct {

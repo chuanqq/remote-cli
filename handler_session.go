@@ -30,13 +30,7 @@ func (h *SessionHandler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 
 	sess := h.sessions.Create(req)
 
-	writeJSON(w, http.StatusCreated, SessionResponse{
-		SessionID:        sess.ID,
-		WorkingDirectory: sess.Cwd(),
-		CreatedAt:        sess.CreatedAt.Format(time.RFC3339),
-		ExpiresAt:        sess.ExpiresAt.Format(time.RFC3339),
-		Shell:            sess.Shell,
-	})
+	writeJSON(w, http.StatusCreated, sessionResponse(sess))
 }
 
 func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +49,7 @@ func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID := parts[0]
 
-	sess := h.sessions.Get(sessionID)
+	sess := h.sessions.Touch(sessionID)
 	if sess == nil {
 		writeError(w, http.StatusNotFound, "not_found", "Session not found or expired")
 		return
@@ -131,6 +125,7 @@ func (h *SessionHandler) HandleExecute(w http.ResponseWriter, r *http.Request) {
 
 	resp := execResultResponse(result)
 	resp.WorkingDirectory = cwd
+	resp.SessionExpiresAt = sess.Expiry().Format(time.RFC3339)
 	writeJSON(w, status, resp)
 }
 

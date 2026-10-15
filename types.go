@@ -8,7 +8,7 @@ import "fmt"
 // -X main.buildTime=...". They must stay package-level vars (not consts) for
 // -X to take effect.
 var (
-	serverVersion = "1.3.0"
+	serverVersion = "1.4.0"
 	gitCommit     = "unknown"
 	buildTime     = "unknown"
 )
@@ -44,7 +44,11 @@ type ExecuteRequest struct {
 }
 
 type ExecuteResponse struct {
-	ID               string `json:"id"`
+	ID string `json:"id"`
+	// State is completed / timed_out / cancelled / not_started (see
+	// executions.go). MCP calls that return before the command finished
+	// answer with ExecutionPending (state=running) instead.
+	State            string `json:"state"`
 	Command          string `json:"command"`
 	ExitCode         int    `json:"exit_code"`
 	Stdout           string `json:"stdout"`
@@ -68,6 +72,9 @@ type ExecuteResponse struct {
 	Error string `json:"error,omitempty"`
 	// Hint is an advisory nudge towards a better-suited tool (MCP only).
 	Hint string `json:"hint,omitempty"`
+	// SessionExpiresAt is the renewed expiry of the session the command ran
+	// in (session execute only).
+	SessionExpiresAt string `json:"session_expires_at,omitempty"`
 }
 
 type StreamEvent struct {
@@ -90,7 +97,10 @@ type SessionResponse struct {
 	WorkingDirectory string `json:"working_directory"`
 	CreatedAt        string `json:"created_at"`
 	ExpiresAt        string `json:"expires_at"`
-	Shell            string `json:"shell"`
+	// TTLSeconds is the idle timeout: every session execute renews
+	// expires_at to now + ttl.
+	TTLSeconds int    `json:"ttl_seconds"`
+	Shell      string `json:"shell"`
 }
 
 type StatusResponse struct {
@@ -118,6 +128,9 @@ type ErrorResponse struct {
 	Error     string `json:"error"`
 	Message   string `json:"message"`
 	RequestID string `json:"request_id,omitempty"`
+	// RetryAfterMs tells a rate-limited client exactly when its next request
+	// will be admitted.
+	RetryAfterMs int64 `json:"retry_after_ms,omitempty"`
 }
 
 // AuditEntry is one audit record. It is emitted as a flat structured log line
@@ -137,4 +150,9 @@ type AuditEntry struct {
 	Truncated        bool
 	TimedOut         bool
 	Error            string // failure reason, when the call failed
+	// State is the execution / wait state (running, completed, pending, ...).
+	State string
+	// Client is the MCP clientInfo "name/version" from the handshake, which
+	// tells agent-driven calls apart from humans using the REST API.
+	Client string
 }

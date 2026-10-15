@@ -97,7 +97,8 @@ export_env() {
     # 以下可选项仅在 env.conf / 环境中设置时导出，未设置则用服务端默认值
     local v
     for v in SHELL_API_LOG_LEVEL SHELL_API_MCP_HEARTBEAT SHELL_API_JOB_DIR \
-             SHELL_API_DENY_COMMANDS SHELL_API_BLOCK_JUMP_HOST SHELL_API_READONLY; do
+             SHELL_API_DENY_COMMANDS SHELL_API_BLOCK_JUMP_HOST SHELL_API_READONLY \
+             SHELL_API_CALL_BUDGET; do
         if [[ -n "${!v:-}" ]]; then export "${v?}"; fi
     done
     # 不设置 TLS 相关变量，确保使用 HTTP
@@ -432,6 +433,8 @@ case "${1:-}" in
         echo "  SHELL_API_FS_ROOT         文件沙箱根目录，逗号分隔可多个（默认: 不限制）"
         echo "  SHELL_API_DISABLED_TOOLS  禁用的 MCP 工具，逗号分隔（默认: 不禁用）"
         echo "  SHELL_API_SHUTDOWN_GRACE  优雅退出时等待执行中命令的秒数（默认: 30）"
+        echo "  SHELL_API_CALL_BUDGET     单次 MCP 调用最长阻塞秒数，需小于客户端请求超时（默认: 50）；"
+        echo "                            超出的命令不杀，返回 execution_id 续取，等待返回 wait_id 续等"
         echo "  SHELL_API_LOG_LEVEL       日志级别 debug|info|warn|error（默认: info；GET /mcp 仅 debug 记录）"
         echo "  SHELL_API_MCP_HEARTBEAT   MCP GET 流心跳间隔秒数，0 关闭（默认: 30）"
         echo "  SHELL_API_JOB_DIR         remote_spawn 后台任务日志目录（默认: \$TMPDIR/remote-agent-proxy-jobs）"

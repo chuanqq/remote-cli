@@ -608,7 +608,7 @@ func TestMCPAuditEndToEnd(t *testing.T) {
 	cfg := &Config{MaxTimeout: 10, MaxOutput: 4096, DefaultShell: "bash", JobDir: t.TempDir(),
 		DisabledTools: map[string]bool{}}
 	audit := NewAuditLogger(logger)
-	mcpHandler := NewMCPHandler(NewExecutor(cfg), &SessionManager{}, testJobManager(t), audit, cfg)
+	mcpHandler := NewMCPHandler(NewExecutor(cfg), &SessionManager{}, testJobManager(t), NewWaitManager(), audit, cfg)
 	h := LoggingMiddleware(logger, mcpHandler)
 
 	post := func(sid string, body string) *httptest.ResponseRecorder {

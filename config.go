@@ -36,6 +36,13 @@ type Config struct {
 	// ShutdownGrace is how long in-flight executions may keep running after
 	// SIGTERM/SIGINT before they are killed.
 	ShutdownGrace time.Duration
+	// CallBudget is the longest a single MCP tool call blocks. MCP clients
+	// abort requests on their own timeout (60s in the TypeScript SDK; seen in
+	// production as calls cancelled at exactly 60s), so work that takes longer
+	// returns a handle instead: remote_execute state=running (fetch with
+	// remote_execution_result), remote_wait_for state=pending (resume by
+	// wait_id); follow_seconds is capped to it.
+	CallBudget time.Duration
 	// JobDir holds the combined stdout/stderr log of every remote_spawn job.
 	JobDir string
 	// DenyCommand, when non-nil, rejects any shell command (execute, session
@@ -55,6 +62,23 @@ type Config struct {
 	ReadOnly bool
 }
 
+// defaultCallBudgetSec stays clear of the common 60s client request timeout.
+const defaultCallBudgetSec = 50
+
+// callBudget returns the effective call budget (configs built by hand in
+// tests may leave it zero).
+func (c *Config) callBudget() time.Duration {
+	if c == nil || c.CallBudget <= 0 {
+		return defaultCallBudgetSec * time.Second
+	}
+	return c.CallBudget
+}
+
+// callBudgetSec is callBudget in whole seconds, for messages and descriptions.
+func (c *Config) callBudgetSec() int {
+	return int(c.callBudget() / time.Second)
+}
+
 func LoadConfig() *Config {
 	cfg := &Config{
 		Port:          getEnv("SHELL_API_PORT", "8080"),
@@ -71,6 +95,11 @@ func LoadConfig() *Config {
 		MCPHeartbeat:  time.Duration(getEnvInt("SHELL_API_MCP_HEARTBEAT", 30)) * time.Second,
 		ShutdownGrace: time.Duration(getEnvInt("SHELL_API_SHUTDOWN_GRACE", 30)) * time.Second,
 		JobDir:        getEnv("SHELL_API_JOB_DIR", filepath.Join(os.TempDir(), "remote-agent-proxy-jobs")),
+	}
+	if b := getEnvInt("SHELL_API_CALL_BUDGET", defaultCallBudgetSec); b > 0 {
+		cfg.CallBudget = time.Duration(b) * time.Second
+	} else {
+		cfg.CallBudget = defaultCallBudgetSec * time.Second
 	}
 
 	cfg.DenyCommand = buildDenyPattern(

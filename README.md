@@ -6,7 +6,7 @@
 
 **English:** A single-binary MCP (Model Context Protocol) server written in Go that lets AI agents (such as Claude Code) securely operate remote hosts. It exposes 24 dedicated tools over Streamable HTTP — shell execution with persistent sessions, file read/write/edit, server-side content search, log tailing with cursors and follow, process/port inspection and an environment profile — so the agent rarely needs to fall back to raw shell commands.
 
-一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 30 个专用工具:命令执行与持久会话、后台任务与条件等待、文件读写编辑、服务端内容搜索、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
+一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 31 个专用工具:命令执行与持久会话、超出调用时长可续取的执行与服务端等待、后台任务、文件读写编辑、服务端内容搜索、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
 
 编译产物为单二进制,零外部运行时依赖;TLS 与 Bearer Token 鉴权开箱即用。
 
@@ -85,7 +85,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 }
 ```
 
-连通后客户端 `tools/list` 应能看到全部 30 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 29 个)。服务另有免鉴权的 `GET /api/status` 健康探针,可用于负载均衡或监控探活。
+连通后客户端 `tools/list` 应能看到全部 31 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 30 个)。服务另有免鉴权的 `GET /api/status` 健康探针,可用于负载均衡或监控探活。
 
 ## 配置项
 
@@ -100,7 +100,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_TLS_CERT` | (空) | TLS 证书路径,留空则监听明文 HTTP |
 | `SHELL_API_TLS_KEY` | (空) | TLS 私钥路径 |
 | `SHELL_API_MAX_TIMEOUT` | `300` | 单次命令超时上限(秒) |
-| `SHELL_API_MAX_OUTPUT` | `1048576` | stdout / stderr 字节上限 |
+| `SHELL_API_MAX_OUTPUT` | `1048576` | stdout / stderr 字节上限(`max_output_bytes` 不能超过它) |
 | `SHELL_API_RATE_LIMIT` | `120` | 限流令牌桶补充速率(每客户端 IP 每分钟),按 IP 计数(不含端口);`GET /mcp` 长连接与 `/api/status` 不计数 |
 | `SHELL_API_RATE_BURST` | `60` | 限流令牌桶容量(每客户端 IP 可连续突发的请求数) |
 | `SHELL_API_DEFAULT_SHELL` | `bash` | 默认 shell |
@@ -108,16 +108,17 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_DISABLED_TOOLS` | (空) | 工具黑名单,逗号分隔的 MCP 工具名,启动时不注册,对客户端不可见 |
 | `SHELL_API_LOG_LEVEL` | `info` | 日志级别 `debug` / `info` / `warn` / `error`;`GET /mcp` 长连接的访问行只在 `debug` 下输出 |
 | `SHELL_API_MCP_HEARTBEAT` | `30` | MCP `GET /mcp` 推送流心跳(ping)间隔秒数,防止中间设备空闲断连;`0` 关闭 |
-| `SHELL_API_SHUTDOWN_GRACE` | `30` | 收到 SIGTERM/SIGINT 后,执行中命令的最长宽限秒数,超时后连同进程组一并杀掉 |
+| `SHELL_API_CALL_BUDGET` | `50` | 单次 MCP 工具调用最长阻塞秒数,应小于客户端请求超时(TypeScript SDK 默认 60s)。超出的命令不被杀,返回 `state=running` + `execution_id` 后续取;等待返回 `state=pending` + `wait_id` 续等;`follow_seconds` 也以此为上限 |
+| `SHELL_API_SHUTDOWN_GRACE` | `30` | 收到 SIGTERM/SIGINT 后,执行中命令(含超出调用时长仍在跑的)的最长宽限秒数,超时后连同进程组一并杀掉 |
 | `SHELL_API_JOB_DIR` | `$TMPDIR/remote-agent-proxy-jobs` | `remote_spawn` 后台任务的日志目录 |
 | `SHELL_API_BLOCK_JUMP_HOST` | (空) | 设为 `true` 时拦截 `ssh` / `gssh` / `scp` / `sftp` / `sshpass` 跳板命令(在跳板机上执行的命令不进入本服务审计) |
 | `SHELL_API_DENY_COMMANDS` | (空) | 自定义命令拦截 RE2 正则,命中即拒绝执行(作用于 execute / session_execute / spawn / wait_for 的 command_exit0);正则非法时拒绝启动 |
 
-## 工具一览(30 个)
+## 工具一览(31 个)
 
 | 分组 | 工具 | 只读模式 |
 | --- | --- | --- |
-| 命令与会话 | `remote_execute` `remote_session_execute` `remote_cancel` `remote_session_create` `remote_session_list` `remote_session_close` | ✗ |
+| 命令与会话 | `remote_execute` `remote_session_execute` `remote_execution_result` `remote_cancel` `remote_session_create` `remote_session_list` `remote_session_close` | ✗ |
 | 命令与会话 | `remote_status` | ✓ |
 | 后台任务与等待 | `remote_spawn` `remote_job_status` `remote_job_list` `remote_job_logs` `remote_job_kill` `remote_wait_for` | ✗ |
 | 文件读写 | `remote_write_file` `remote_edit_file` `remote_upload_base64` | ✗ |
@@ -126,7 +127,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | 文件管理 | `remote_move_file` `remote_copy_file` `remote_delete_file` `remote_make_dir` | ✗ |
 | 主机洞察 | `remote_list_processes` `remote_check_port` `remote_get_env_info` | ✓ |
 
-"只读模式"列标 ✓ 的 11 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 19 个会被强制下线。
+"只读模式"列标 ✓ 的 11 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 20 个会被强制下线。
 
 下面按分组给出每个工具的参数与用法。参数表中"必填"列标 `*` 的为必填;示例为 MCP `tools/call` 的 `arguments` 内容。
 
@@ -134,12 +135,16 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_execute`
 
-执行单条 shell 命令并等待结束,返回 exit code / stdout / stderr / 耗时。默认超时 30s。搜索、看日志、查文件优先用专用工具(结构化返回、零匹配不报错);需要等待某个条件时用 `remote_wait_for`,不要 `sleep N; check`;需要常驻后台的进程用 `remote_spawn`,不要 `nohup ... &`。
+执行单条 shell 命令,返回 `state` / exit code / stdout / stderr / 耗时。默认超时 30s。
+
+**调用时长与命令时长解耦**:一次调用最多阻塞 `SHELL_API_CALL_BUDGET`(默认 50s,低于常见客户端 60s 请求超时)。命令在此之前结束则照常内联返回;仍在运行则**不杀**,立即返回 `state=running` 与 `execution_id`,用 `remote_execution_result` 续取最终结果——不要重发命令。客户端请求超时、取消或断连同样**不会**终止命令,只有它自己的 `timeout_ms`、`remote_cancel` 或服务退出会。最终 `state` 取值:`completed`(自然退出,看 `exit_code`)、`timed_out`(到 `timeout_ms` 被杀,`error` 写明阈值)、`cancelled`、`not_started`(被拦截/未能启动,什么都没执行)。
+
+搜索、看日志、查文件优先用专用工具(结构化返回、零匹配不报错);需要等待某个条件时用 `remote_wait_for`,不要 `sleep N; check`;需要常驻后台的进程用 `remote_spawn`,不要 `nohup ... &`。
 
 - 输出按 `max_output_bytes` 有界捕获(内存不随输出增长),返回 `stdout_total_bytes` / `stderr_total_bytes` 说明原始输出量
 - 命令未能启动(工作目录不存在、shell 不存在、被拦截)时返回 `exit_code=-1` 与 `error` 说明原因
 - shell 已退出但后台子进程仍占用输出管道时,最多再等 2s 即返回,不会卡到超时
-- 客户端取消请求或断开连接时,命令连同进程组被终止
+- 超出调用预算仍在运行的命令,结束时审计日志再写一行最终状态(同一 `exec_id`)
 - 响应可能带 `hint` 字段,建议更合适的专用工具(仅提示,不影响执行)
 
 | 参数 | 类型 | 必填 | 说明 |
@@ -147,7 +152,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `command` | string | * | 要执行的命令,最长 10000 字符 |
 | `working_directory` | string | | 工作目录,优先于 `cd X && ...` 前缀 |
 | `environment` | object | | 追加的环境变量键值对 |
-| `timeout_ms` | number | | 超时毫秒数,默认取服务端配置 |
+| `timeout_ms` | number | | 命令超时毫秒数,默认 30000,上限 `SHELL_API_MAX_TIMEOUT`;与调用预算无关 |
 | `max_output_bytes` | number | | stdout/stderr 捕获上限,默认取服务端配置 |
 | `truncate_mode` | string | | 超限保留 `head`(默认)或 `tail`(看日志更友好) |
 | `output_encoding` | string | | 把输出从该编码转为 UTF-8:`utf-8`(默认,原样)、`gbk`、`gb2312`、`gb18030`、`auto`(合法 UTF-8 原样保留,否则按 GBK 解码) |
@@ -174,11 +179,11 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 {"working_directory": "/data/project", "environment": {"ENV": "prod"}, "ttl_seconds": 7200}
 ```
 
-`remote_session_list` 无参数,返回存活会话的 id / cwd / shell / 过期时间;`remote_session_close` 仅需 `session_id`(必填)。
+`ttl_seconds` 是**空闲超时**:每次 `remote_session_execute` 都把过期时间续到"当前 + TTL"(结果里的 `session_expires_at`),长任务中持续使用的会话不会中途过期;过期会话连同 cwd/env 一起消失。`remote_session_list` 无参数,返回存活会话的 id / cwd / shell / `ttl_seconds` / 过期时间;`remote_session_close` 仅需 `session_id`(必填)。
 
 #### `remote_session_execute`
 
-在持久会话中执行命令。成功的裸 `cd <dir>` 会持久化会话 cwd,后续命令无需再带路径前缀。
+在持久会话中执行命令。成功的裸 `cd <dir>` 会持久化会话 cwd,后续命令无需再带路径前缀。执行语义与 `remote_execute` 相同(超出调用预算返回 `state=running` + `execution_id`),并续期会话 TTL。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -191,9 +196,17 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 {"session_id": "s-xxxx", "command": "cd /var/log/nginx"}
 ```
 
+#### `remote_execution_result`
+
+取回超出调用预算的命令结果。传 `execution_id`:最多等 `wait_seconds`(默认且最大为调用预算)直到命令结束,返回完整结果;仍未结束则再次返回 `state=running`,继续调用即可。不传 `execution_id`:列出最近 30 分钟内最新的 20 条执行(含 `state` / `exit_code`,`total` 为总数)——调用在拿到任何响应前就被切断时,用它确认命令是否执行过、结果如何,而不是盲目重发。最近 16 条已结束执行保留 stdout/stderr。
+
+```json
+{"execution_id": "d8e32e24-3d3e-4434-a1ad-6c69a40bcd8e"}
+```
+
 #### `remote_cancel` / `remote_status`
 
-`remote_cancel` 按执行 ID 取消运行中的命令(参数 `execution_id`,必填,来自 execute 的返回)。`remote_status` 无参数,返回服务健康、版本(含 `commit` / `build_time`)、运行时长、活跃会话数与系统信息。
+`remote_cancel` 按执行 ID 取消运行中的命令(参数 `execution_id`,必填,来自 execute 的返回),返回取消后的状态;结果仍可用 `remote_execution_result` 查看。`remote_status` 无参数,返回服务健康、版本(含 `commit` / `build_time`)、运行时长、活跃会话数与系统信息。
 
 ### 后台任务与等待
 
@@ -214,7 +227,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_wait_for`
 
-服务端轮询,条件满足即返回(附匹配内容),取代 `sleep N; check`。超时返回 `satisfied=false, timed_out=true`。
+服务端轮询,条件满足即返回(附匹配内容),取代 `sleep N; check`。等待以**服务端 watcher** 运行,最长 `timeout_seconds`(上限 24h),不受客户端请求超时限制:一次调用最多阻塞调用预算,届时未决则返回 `state=pending` + `wait_id`,再次调用只传 `wait_id` 即续等**同一个** watcher(`log_regex` 保留偏移,两次调用之间写入的行不会漏);`wait_id` + `cancel=true` 停止。最终 `state`:`satisfied` / `timed_out` / `cancelled`。
 
 | condition | target | 说明 |
 | --- | --- | --- |
@@ -225,10 +238,11 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `port_listen` | 端口号 | 端口开始监听 |
 | `command_exit0` | shell 命令 | 每个间隔重跑一次,直到退出码为 0 |
 
-其他参数:`pattern`(RE2)、`ignore_case`、`timeout_seconds`(默认 60,最大 300)、`interval_ms`(默认 1000,最小 200)、`encoding`(文件条件的源编码,如 `gbk`)。
+其他参数:`pattern`(RE2)、`ignore_case`、`timeout_seconds`(默认等于调用预算,最大 86400)、`interval_ms`(默认 1000,最小 200;`command_exit0` 最小 1000)、`encoding`(文件条件的源编码,如 `gbk`)、`wait_id`、`cancel`。
 
 ```json
-{"condition": "log_regex", "target": "/data/app/log/app.log", "pattern": "init success|FATAL", "timeout_seconds": 300}
+{"condition": "log_regex", "target": "/data/app/log/app.log", "pattern": "init success|FATAL", "timeout_seconds": 5400}
+{"wait_id": "wait-1a2b3c4d"}
 ```
 
 ### 文件读写
@@ -253,7 +267,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_write_file`
 
-写入 UTF-8 文本,支持目标编码转换、追加模式、自动建父目录;返回 sha256/mode 写后自检,可选写后 lint。二进制请用 `remote_upload_base64`。
+写入 UTF-8 文本,支持目标编码转换、追加模式、自动建父目录;返回 sha256/mode 写后自检,可选写后 lint。二进制请用 `remote_upload_base64`。`dry_run=true` 不写盘,返回将写入的字节数 / sha256 / 是否新建 / 权限,以及与现有内容的 unified diff(`preview.diff`,3 行上下文)。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -264,6 +278,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `make_dirs` | boolean | | 自动创建父目录,默认 false |
 | `mode` | string | | 新文件权限(八进制),默认 `0644` |
 | `lint` | string | | 写后语法检查:`bash`(bash -n)/`python`(py_compile),结果仅供参考 |
+| `dry_run` | boolean | | 只预览不写盘,返回 `preview.diff`;默认 false |
 
 ```json
 {"path": "/data/app/deploy.sh", "content": "#!/bin/bash\nset -e\n...", "mode": "0755", "lint": "bash"}
@@ -375,7 +390,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `filter_regex` | string | | RE2 过滤,只返回匹配行;游标推进不受过滤影响 |
 | `since_line` | number | | 行游标:返回该行号(1 基)之后的行(取上次 `end_line`) |
 | `since_offset` | number | | 字节游标:返回该偏移之后的内容(取上次 `end_offset`),优先于 `since_line` |
-| `follow_seconds` | number | | 最多等待 N 秒(≤300)新内容;无新内容时 `timed_out=true` |
+| `follow_seconds` | number | | 最多等待 N 秒新内容(上限为调用预算);无新内容时 `timed_out=true`,用 `since_offset=end_offset` 再调用继续跟 |
 | `encoding` | string | | 源编码,缺省自动探测 |
 | `max_bytes` | number | | 收集内容字节上限,默认 1MB |
 
@@ -465,7 +480,7 @@ SHELL_API_TOKEN=xxx SHELL_API_READONLY=true ./remote-agent-proxy
 
 | 层 | 位置 | 作用 |
 | --- | --- | --- |
-| 1. 工具注册 | `config.go` `toolEnabled` + 各 `register*` | 19 个写工具**不注册**,`tools/list` 里根本不存在 |
+| 1. 工具注册 | `config.go` `toolEnabled` + 各 `register*` | 20 个写工具**不注册**,`tools/list` 里根本不存在 |
 | 2. REST 路由 | `main.go` | `/api/execute`、`/api/execute/stream`、`/api/sessions*`、`/api/executions/*` 返回 403 `read_only_mode` |
 | 3. HTTP 中间件 | `middleware.go` `ReadOnlyMiddleware` | `/api/` 下只放行 GET / HEAD,新增端点默认被拦 |
 | 4. 操作兜底 | `readonly.go` `guardReadOnly` | `WriteFileContent` / `EditFileContent` / `UploadBase64` / `MoveFile` / `CopyFile` / `DeleteFile` / `MakeDir` / `Executor.Execute` / `ExecuteStream` / `LintFile` 内部直接失败 |
@@ -515,7 +530,7 @@ SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
 SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-proxy
 ```
 
-可禁用的工具名即上文列出的 30 个。
+可禁用的工具名即上文列出的 31 个。
 
 如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,拦不住 `/api/execute` 等 REST 端点,漏写一个工具名就留一个写通路。
 
@@ -524,7 +539,7 @@ SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-
 服务的所有日志都是一行一个 JSON 对象(`log/slog`),输出到 stderr。两类记录通过 `req_id` 关联,同一请求的 `req_id` 也在响应头 `X-Request-Id` 中返回:
 
 - **访问日志** `type=access`:`req_id / remote / method / path / status / bytes / dur_ms`,MCP 请求另带 `mcp_method`(`initialize` / `tools/list` / `tools/call` …)、`tool` 与 `mcp_session`。401 / 429 也会记录。`GET /mcp` 长连接只在 `SHELL_API_LOG_LEVEL=debug` 下记录
-- **审计日志** `type=audit`:每次工具调用一行,由统一的 MCP 工具中间件写入,字段 `req_id / exec_id / remote / mcp_session / tool / session_id / command / working_directory / exit_code / dur_ms / output_bytes / truncated / timed_out / error`。`tool` 一律为注册工具名,`remote` 为真实对端 IP(不含端口),失败时 `error` 给出原因;REST 接口的 `tool` 为 `rest_execute` / `rest_session_execute` / `rest_execute_stream`
+- **审计日志** `type=audit`:每次工具调用一行,由统一的 MCP 工具中间件写入,字段 `req_id / exec_id / remote / mcp_session / client / tool / session_id / command / working_directory / exit_code / dur_ms / output_bytes / truncated / timed_out / state / error`。`client` 是 MCP 握手 `clientInfo` 的 `name/version`(区分 agent 与人工 REST 调用);超出调用预算的命令先记一行 `state=running`,结束时再以同一 `exec_id` 记一行最终状态。`tool` 一律为注册工具名,`remote` 为真实对端 IP(不含端口),失败时 `error` 给出原因;REST 接口的 `tool` 为 `rest_execute` / `rest_session_execute` / `rest_execute_stream`
 
 ```json
 {"time":"...","level":"INFO","msg":"audit","type":"audit","req_id":"r-4497e438","remote":"172.26.97.60","tool":"remote_execute","command":"echo hi","exit_code":0,"dur_ms":5,"output_bytes":3,"timed_out":false,"exec_id":"04034b32-...","mcp_session":"mcp-session-..."}

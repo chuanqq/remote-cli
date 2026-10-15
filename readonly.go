@@ -147,6 +147,7 @@ var allToolNames = []string{
 	"remote_job_logs",
 	"remote_job_kill",
 	"remote_wait_for",
+	"remote_execution_result",
 }
 
 // parseReadOnly interprets the SHELL_API_READONLY value. Accepted truthy forms:

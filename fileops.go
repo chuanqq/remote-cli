@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
@@ -144,6 +145,7 @@ type WriteFileRequest struct {
 	MakeDirs bool   // true auto-creates parent dirs
 	Mode     string // optional octal string like "0644", empty defaults 0644
 	Lint     string // optional post-write syntax check: "bash" | "python"
+	DryRun   bool   // report what would be written (with a diff) without writing
 }
 
 type WriteFileResult struct {
@@ -154,7 +156,27 @@ type WriteFileResult struct {
 	SHA256       string      `json:"sha256"`          // digest of the bytes written this call
 	Mode         string      `json:"mode"`            // resulting permission bits, e.g. "0644"
 	Lint         *LintResult `json:"lint,omitempty"` // only when lint requested
+	// DryRun: nothing was written; bytes_written / sha256 / created / mode
+	// describe what the write would do, and Preview shows the change.
+	DryRun  bool          `json:"dry_run,omitempty"`
+	Preview *WritePreview `json:"preview,omitempty"`
 }
+
+// WritePreview is the dry-run view of a write: a unified diff (3 lines of
+// context) from the current file content to the would-be content.
+type WritePreview struct {
+	Unchanged     bool   `json:"unchanged"`
+	LinesAdded    int    `json:"lines_added"`
+	LinesRemoved  int    `json:"lines_removed"`
+	Diff          string `json:"diff,omitempty"`
+	DiffTruncated bool   `json:"diff_truncated,omitempty"`
+	Note          string `json:"note,omitempty"`
+}
+
+const (
+	maxPreviewDiffBytes = 64 << 10
+	maxPreviewFileBytes = 8 << 20
+)
 
 // WriteFileContent writes text content to a file, encoding it to the target
 // encoding, optionally appending and creating parent directories.
@@ -170,6 +192,9 @@ func WriteFileContent(req WriteFileRequest, roots []string) (*WriteFileResult, e
 	mode, err := parseMode(req.Mode)
 	if err != nil {
 		return nil, err
+	}
+	if req.DryRun {
+		return previewWrite(req, abs, mode)
 	}
 
 	if req.MakeDirs {
@@ -231,6 +256,96 @@ func WriteFileContent(req WriteFileRequest, roots []string) (*WriteFileResult, e
 		result.Lint = LintFile(abs, req.Lint)
 	}
 	return result, nil
+}
+
+// previewWrite is WriteFileContent's dry run: the same validation, then a
+// report of the would-be write — nothing on disk is touched.
+func previewWrite(req WriteFileRequest, abs string, mode os.FileMode) (*WriteFileResult, error) {
+	encoding := req.Encoding
+	if encoding == "" {
+		encoding = "utf-8"
+	}
+	data, err := encodeFromUTF8(req.Content, encoding)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(data)
+	result := &WriteFileResult{
+		Path:         abs,
+		BytesWritten: len(data),
+		Encoding:     encoding,
+		SHA256:       hex.EncodeToString(sum[:]),
+		DryRun:       true,
+		Preview:      &WritePreview{},
+	}
+	if req.Lint != "" && req.Lint != "none" {
+		result.Preview.Note = "lint is not run in dry_run. "
+	}
+
+	fi, statErr := os.Stat(abs)
+	switch {
+	case statErr == nil && fi.IsDir():
+		return nil, fmt.Errorf("%s is a directory", abs)
+	case statErr == nil:
+		result.Mode = fi.Mode().Perm().String()
+	case os.IsNotExist(statErr):
+		result.Created = true
+		result.Mode = mode.Perm().String()
+		if dir := filepath.Dir(abs); !req.MakeDirs {
+			if _, err := os.Stat(dir); err != nil {
+				return nil, fmt.Errorf("parent directory %s does not exist (set make_dirs=true)", dir)
+			}
+		}
+	default:
+		return nil, statErr
+	}
+
+	var old []byte
+	if !result.Created {
+		if fi.Size() > maxPreviewFileBytes {
+			result.Preview.Note += fmt.Sprintf("existing file is %d bytes: too large to diff.", fi.Size())
+			return result, nil
+		}
+		if old, err = os.ReadFile(abs); err != nil {
+			return nil, err
+		}
+		result.Preview.Unchanged = bytes.Equal(old, encodedResult(old, data, req.Append))
+		if looksBinary(old) {
+			result.Preview.Note += "existing file is binary: no diff."
+			return result, nil
+		}
+	}
+	oldText := ""
+	if len(old) > 0 {
+		if oldText, err = decodeToUTF8(old, detectEncoding(old)); err != nil {
+			result.Preview.Note += "existing content could not be decoded: no diff."
+			return result, nil
+		}
+	}
+	newText := req.Content
+	if req.Append {
+		newText = oldText + req.Content
+		result.Preview.Note += "append mode: the diff shows the file after appending."
+	}
+	if len(newText) > maxPreviewFileBytes {
+		result.Preview.Note += "new content too large to diff."
+		return result, nil
+	}
+	diff, added, removed, truncated := unifiedDiff(oldText, newText, maxPreviewDiffBytes)
+	result.Preview.Diff = diff
+	result.Preview.LinesAdded = added
+	result.Preview.LinesRemoved = removed
+	result.Preview.DiffTruncated = truncated
+	result.Preview.Note = strings.TrimSpace(result.Preview.Note)
+	return result, nil
+}
+
+// encodedResult is the file content a write of data would leave.
+func encodedResult(old, data []byte, appendMode bool) []byte {
+	if appendMode {
+		return append(append([]byte{}, old...), data...)
+	}
+	return data
 }
 
 type ReadFileRequest struct {

@@ -26,10 +26,15 @@ const execWaitDelay = 2 * time.Second
 type Executor struct {
 	config  *Config
 	running sync.Map // map[string]context.CancelFunc
+
+	// execs tracks Launch-ed executions whose result has not been handed
+	// back inline (see executions.go).
+	mu    sync.Mutex
+	execs map[string]*Execution
 }
 
 func NewExecutor(cfg *Config) *Executor {
-	return &Executor{config: cfg}
+	return &Executor{config: cfg, execs: make(map[string]*Execution)}
 }
 
 type ExecResult struct {
@@ -54,6 +59,9 @@ type ExecResult struct {
 	// NotStarted is true when no process was spawned at all (refused by
 	// policy / read-only mode, bad working directory, start failure).
 	NotStarted bool
+	// Cancelled is true when the run was cut short by remote_cancel, the
+	// caller's context or server shutdown (not by its own timeout).
+	Cancelled bool
 }
 
 // checkCommand applies the operator deny policy (SHELL_API_DENY_COMMANDS /
@@ -138,9 +146,24 @@ func newCommand(ctx context.Context, shell, command, dir string, env map[string]
 
 // Execute runs req.Command and waits for it. ctx is the caller's request
 // context: when the client goes away the command is killed instead of running
-// on to its timeout unobserved.
+// on to its timeout unobserved. (MCP remote_execute uses Launch instead, which
+// is not bound to the request.)
 func (e *Executor) Execute(ctx context.Context, req ExecuteRequest) *ExecResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	id := uuid.New().String()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	e.running.Store(id, cancel)
+	defer e.running.Delete(id)
+	return e.execute(ctx, id, req)
+}
+
+// execute runs one command under ctx (plus its own timeout). Callers register
+// id in e.running so remote_cancel and shutdown can reach it.
+
+func (e *Executor) execute(ctx context.Context, id string, req ExecuteRequest) *ExecResult {
 	now := time.Now()
 	fail := func(msg string) *ExecResult {
 		return &ExecResult{
@@ -176,19 +199,19 @@ func (e *Executor) Execute(ctx context.Context, req ExecuteRequest) *ExecResult 
 	}
 
 	maxOutput := req.MaxOutputBytes
-	if maxOutput <= 0 {
+	if maxOutput <= 0 || (e.config.MaxOutput > 0 && maxOutput > e.config.MaxOutput) {
+		// SHELL_API_MAX_OUTPUT is a ceiling, not just a default: results of
+		// detached executions are held in memory until fetched.
 		maxOutput = e.config.MaxOutput
 	}
 	if maxOutput <= 0 {
 		maxOutput = 1
 	}
 	keepTail := strings.EqualFold(req.TruncateMode, "tail")
+	timeout := e.resolveTimeout(req.TimeoutMs)
 
-	ctx, cancel := context.WithTimeout(ctx, e.resolveTimeout(req.TimeoutMs))
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
-	e.running.Store(id, cancel)
-	defer e.running.Delete(id)
 
 	cmd := newCommand(ctx, e.resolveShell(req.Shell), req.Command, req.WorkingDirectory, req.Environment)
 
@@ -211,6 +234,14 @@ func (e *Executor) Execute(ctx context.Context, req ExecuteRequest) *ExecResult 
 	duration := time.Since(start)
 
 	exitCode, timedOut, errMsg := classifyWait(ctx, cmd, waitErr)
+	cancelled := !timedOut && waitErr != nil && !errors.Is(waitErr, exec.ErrWaitDelay) &&
+		errors.Is(ctx.Err(), context.Canceled)
+	if timedOut {
+		// Name the limit that fired, so a killed command is never mistaken
+		// for a slow one or a client-side timeout.
+		errMsg = fmt.Sprintf("killed: exceeded timeout_ms=%d (server max %ds); raise timeout_ms, "+
+			"or run long work with remote_spawn", timeout.Milliseconds(), e.config.MaxTimeout)
+	}
 
 	stdoutStr, stdoutTrunc, enc := finishOutput(stdout, maxOutput, keepTail, encoding)
 	stderrStr, stderrTrunc, _ := finishOutput(stderr, maxOutput, keepTail, encoding)
@@ -226,6 +257,7 @@ func (e *Executor) Execute(ctx context.Context, req ExecuteRequest) *ExecResult 
 		CompletedAt:      time.Now(),
 		WorkingDirectory: req.WorkingDirectory,
 		TimedOut:         timedOut,
+		Cancelled:        cancelled,
 		StdoutTruncated:  stdoutTrunc,
 		StderrTruncated:  stderrTrunc,
 		StdoutTotalBytes: stdout.total,
@@ -262,7 +294,7 @@ func classifyWait(ctx context.Context, cmd *exec.Cmd, waitErr error) (int, bool,
 	case context.DeadlineExceeded:
 		return exitCode, true, ""
 	case context.Canceled:
-		return exitCode, false, "execution cancelled (remote_cancel, client disconnect or server shutdown)"
+		return exitCode, false, "execution cancelled (remote_cancel, server shutdown, or the REST client disconnected)"
 	}
 	return exitCode, false, ""
 }

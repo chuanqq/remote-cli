@@ -70,6 +70,7 @@ type auditNote struct {
 	Truncated        bool
 	TimedOut         bool
 	Error            string
+	State            string
 }
 
 type auditNoteKey struct{}
@@ -114,9 +115,11 @@ func withAudit(audit *AuditLogger) server.ToolHandlerMiddleware {
 				Truncated:        note.Truncated,
 				TimedOut:         note.TimedOut,
 				Error:            note.Error,
+				State:            note.State,
 			}
 			if cs := server.ClientSessionFromContext(ctx); cs != nil {
 				entry.MCPSession = cs.SessionID()
+				entry.Client = clientLabel(cs)
 			}
 			if entry.Command == "" {
 				// Never fall back to raw arguments: they may carry file
@@ -149,6 +152,24 @@ func nonZero(code int) int {
 		return 1
 	}
 	return code
+}
+
+// clientLabel returns the MCP client's self-reported "name/version" from the
+// initialize handshake, or "" when unknown.
+func clientLabel(cs server.ClientSession) string {
+	withInfo, ok := cs.(server.SessionWithClientInfo)
+	if !ok {
+		return ""
+	}
+	ci := withInfo.GetClientInfo()
+	if ci.Name == "" {
+		return ""
+	}
+	label := ci.Name
+	if ci.Version != "" {
+		label += "/" + ci.Version
+	}
+	return truncateString(label, 100)
 }
 
 // resultText concatenates the text content of a tool result.

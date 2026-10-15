@@ -47,6 +47,12 @@ func (a *AuditLogger) Log(entry AuditEntry) {
 	if entry.Truncated {
 		attrs = append(attrs, slog.Bool("truncated", true))
 	}
+	if entry.State != "" {
+		attrs = append(attrs, slog.String("state", entry.State))
+	}
+	if entry.Client != "" {
+		attrs = append(attrs, slog.String("client", entry.Client))
+	}
 	if entry.Error != "" {
 		attrs = append(attrs, slog.String("error", RedactCommand(entry.Error)))
 	}

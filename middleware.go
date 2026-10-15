@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -75,15 +76,26 @@ func (rl *RateLimiter) refill(key string, now time.Time) *bucket {
 // Allow consumes one token for key and reports whether the request may pass,
 // plus the whole tokens left afterwards.
 func (rl *RateLimiter) Allow(key string) (bool, int) {
+	ok, remaining, _ := rl.take(key)
+	return ok, remaining
+}
+
+// take is Allow that also says, for a refused request, how long until the
+// bucket holds a whole token again — the exact backoff a client needs.
+func (rl *RateLimiter) take(key string) (bool, int, time.Duration) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	b := rl.refill(key, rl.now())
 	if b.tokens < 1 {
-		return false, 0
+		if rl.perMin <= 0 {
+			return false, 0, time.Minute
+		}
+		wait := time.Duration((1 - b.tokens) / float64(rl.perMin) * float64(time.Minute))
+		return false, 0, wait
 	}
 	b.tokens--
-	return true, int(b.tokens)
+	return true, int(b.tokens), 0
 }
 
 // Len reports the number of tracked buckets (for tests).
@@ -123,10 +135,18 @@ func RateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 			return
 		}
 
-		ok, remaining := rl.Allow(remoteHost(r.RemoteAddr))
+		ok, remaining, wait := rl.take(remoteHost(r.RemoteAddr))
 		if !ok {
-			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(60.0/float64(rl.perMin)))))
-			writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Too many requests")
+			waitMs := wait.Milliseconds() + 1 // round up: never early
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(float64(waitMs)/1000))))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: "rate_limit_exceeded",
+				Message: fmt.Sprintf("Too many requests: limit %d/min per client host (burst %d); retry in %dms",
+					rl.perMin, rl.burst, waitMs),
+				RetryAfterMs: waitMs,
+			})
 			return
 		}
 
