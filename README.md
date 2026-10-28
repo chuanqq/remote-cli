@@ -6,7 +6,7 @@
 
 **English:** A single-binary MCP (Model Context Protocol) server written in Go that lets AI agents (such as Claude Code) securely operate remote hosts. It exposes 24 dedicated tools over Streamable HTTP — shell execution with persistent sessions, file read/write/edit, server-side content search, log tailing with cursors and follow, process/port inspection and an environment profile — so the agent rarely needs to fall back to raw shell commands.
 
-一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 31 个专用工具:命令执行与持久会话、超出调用时长可续取的执行与服务端等待、后台任务、文件读写编辑、服务端内容搜索、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
+一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 33 个专用工具:命令执行与持久会话、超出调用时长可续取的执行与服务端等待、后台任务、文件读写编辑与批量读取、服务端内容搜索与文件/目录对比、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
 
 编译产物为单二进制,零外部运行时依赖;TLS 与 Bearer Token 鉴权开箱即用。
 
@@ -85,7 +85,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 }
 ```
 
-连通后客户端 `tools/list` 应能看到全部 31 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 30 个)。服务另有免鉴权的 `GET /api/status` 健康探针,可用于负载均衡或监控探活。
+连通后客户端 `tools/list` 应能看到全部 33 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 32 个)。服务另有免鉴权的 `GET /api/status` 健康探针,可用于负载均衡或监控探活。
 
 ## 配置项
 
@@ -114,7 +114,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_BLOCK_JUMP_HOST` | (空) | 设为 `true` 时拦截 `ssh` / `gssh` / `scp` / `sftp` / `sshpass` 跳板命令(在跳板机上执行的命令不进入本服务审计) |
 | `SHELL_API_DENY_COMMANDS` | (空) | 自定义命令拦截 RE2 正则,命中即拒绝执行(作用于 execute / session_execute / spawn / wait_for 的 command_exit0);正则非法时拒绝启动 |
 
-## 工具一览(31 个)
+## 工具一览(33 个)
 
 | 分组 | 工具 | 只读模式 |
 | --- | --- | --- |
@@ -122,12 +122,12 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | 命令与会话 | `remote_status` | ✓ |
 | 后台任务与等待 | `remote_spawn` `remote_job_status` `remote_job_list` `remote_job_logs` `remote_job_kill` `remote_wait_for` | ✗ |
 | 文件读写 | `remote_write_file` `remote_edit_file` `remote_upload_base64` | ✗ |
-| 文件读写 | `remote_read_file` `remote_list_dir` `remote_stat` `remote_download_base64` | ✓ |
-| 搜索与日志 | `remote_search_content` `remote_find_files` `remote_tail_log` | ✓ |
+| 文件读写 | `remote_read_file` `remote_read_files` `remote_list_dir` `remote_stat` `remote_download_base64` | ✓ |
+| 搜索、对比与日志 | `remote_search_content` `remote_find_files` `remote_diff` `remote_tail_log` | ✓ |
 | 文件管理 | `remote_move_file` `remote_copy_file` `remote_delete_file` `remote_make_dir` | ✗ |
 | 主机洞察 | `remote_list_processes` `remote_check_port` `remote_get_env_info` | ✓ |
 
-"只读模式"列标 ✓ 的 11 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 20 个会被强制下线。
+"只读模式"列标 ✓ 的 13 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 20 个会被强制下线。
 
 下面按分组给出每个工具的参数与用法。参数表中"必填"列标 `*` 的为必填;示例为 MCP `tools/call` 的 `arguments` 内容。
 
@@ -249,20 +249,47 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_read_file`
 
-读取远程文件并返回 UTF-8 内容。seek 式读取,大文件不会整体载入内存;自动探测编码,识别二进制文件(二进制请用 `remote_download_base64`)。等效 shell 映射:`cat` = 只传 `path`;`sed -n 'X,Yp'` = `start_line`/`end_line`;`tail -n +N` = `start_line=N`;`tail -N` = `tail_lines=N`;`head -c N` = `max_bytes=N`。
+读取远程文件并返回 UTF-8 内容。每次返回一个"窗口"(默认 64KB),大文件不会整体载入内存;自动探测编码(utf-8 / gbk,窗口切在多字节字符中间也不会误判),识别二进制文件(二进制请用 `remote_download_base64`)。
+
+- 行区间流式定位:`start_line` / `end_line` 可读任意大小文件的任意行。
+- 窗口不会在字符中间截断;未到文件尾时返回 `truncated: true`,并给出续读游标 `next_offset` / `next_start_line` 和 `hint`。
+- 元数据字段排在 `content` 之前:客户端截断超大结果(Claude Code 只保留前 100,000 字符)时游标不会丢。
+
+等效 shell 映射:`cat` = 只传 `path`;`sed -n 'X,Yp'` = `start_line`/`end_line`;`nl -ba` / `cat -n` = `line_numbers: true`;`tail -N` = `tail_lines=N`;`head -c N` = `max_bytes=N`。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `path` | string | * | 文件路径(绝对或相对) |
 | `encoding` | string | | 源编码,缺省自动探测(utf-8/gbk/gb2312/gb18030) |
-| `start_line` / `end_line` | number | | 1 起始止行号(含),0 或缺省表示文件头/尾 |
+| `start_line` / `end_line` | number | | 1 起始止行号(含),0 或缺省表示文件头/尾;流式定位,不受 `max_bytes` 限制 |
 | `tail_lines` | number | | 读最后 N 行(seek 实现,支持超大文件),优先于行区间 |
-| `offset_bytes` | number | | 从该字节偏移开始读,默认 0 |
-| `max_bytes` | number | | 读取字节上限,默认 1MB |
+| `offset_bytes` | number | | 从该字节偏移开始读(如上次的 `next_offset`),默认 0 |
+| `max_bytes` | number | | 本次读取字节上限,默认 64KB,最大 16MB |
 | `truncate_mode` | string | | 超限保留 `head`(默认)或 `tail` |
+| `line_numbers` | boolean | | 每行前加行号与制表符(`cat -n` 格式),默认 false |
+| `lines` | array | | 只读这些行号(任意顺序,最多 1000 个),按行号升序返回并带行号;优先于其他模式。超出文件末尾的行号列在 `missing_lines` |
+| `format` | string | | `json`(默认)或 `text`,见下文「文本格式输出」 |
 
 ```json
-{"path": "/data/app/logs/app.log", "tail_lines": 200}
+{"path": "/data/app/src/charge_model.cpp", "start_line": 600, "end_line": 760, "line_numbers": true}
+```
+
+#### `remote_read_files`
+
+一次读取多个文件,替代 `for f in ...; do echo "=== $f"; cat $f; done`。最多 50 个文件共享一个 `max_bytes` 预算(默认 64KB):小文件优先完整返回,大文件分摊剩余预算并以 `truncated: true` 加续读游标返回(同 `remote_read_file`)。单个文件失败只在该项带 `error`,不影响其余文件;预算或数量耗尽时未读的文件列在 `not_read`。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `paths` | array | *¹ | 按顺序整文件读取;路径不存在且含 `*` `?` `[` 时按 glob 展开(只匹配根目录内的普通文件,排序) |
+| `files` | array | *¹ | 每项可带窗口:`{path, start_line?, end_line?, tail_lines?, lines?, offset_bytes?, max_bytes?, encoding?}`,含义同 `remote_read_file` |
+| `line_numbers` | boolean | | 所有文件都输出 `cat -n` 格式,默认 false |
+| `max_bytes` | number | | 所有文件共享的内容预算,默认 64KB,最大 16MB |
+| `format` | string | | `json`(默认)或 `text`,见下文「文本格式输出」 |
+
+¹ `paths` 与 `files` 至少传一个。
+
+```json
+{"paths": ["/data/app/conf/*.conf"], "files": [{"path": "/data/app/src/main.cpp", "lines": [604, 620, 1658]}]}
 ```
 
 #### `remote_write_file`
@@ -316,16 +343,20 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_stat`
 
-路径元数据:存在性、类型、大小、权限、owner/group、nlink、mtime、symlink 目标、二进制嗅探;可选内容哈希与编码探测。一次调用替代 `stat -c ...; file -I; md5sum` 三连;路径不存在返回 `exists=false` 而非报错。
+路径元数据:存在性、类型、大小、权限、owner/group、nlink、mtime、symlink 目标、二进制嗅探;可选内容哈希、编码探测与文本信息。一次调用替代 `stat -c ...; file -I; md5sum; wc -l` 一串命令;路径不存在返回 `exists=false` 而非报错。传 `paths` 可一次查询多个路径,每个结果单独带 `error`。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `path` | string | * | 文件或目录路径 |
+| `path` | string | *¹ | 文件或目录路径 |
+| `paths` | array | *¹ | 一次查询多个路径(最多 200 个),返回 `{count, results: [...]}` |
 | `include_hash` | string | | `md5` / `sha256`,流式计算(常规文件 ≤256MB) |
 | `include_encoding` | boolean | | 探测文本编码(utf-8/gbk/unknown) |
+| `include_text` | boolean | | 文本信息(常规文件 ≤256MB):行数(同 `wc -l`,无结尾换行的末行也计入)、换行符 `lf` / `crlf` / `mixed` / `cr`、是否以换行结尾、BOM、最长行字节数 |
+
+¹ `path` 与 `paths` 至少传一个。
 
 ```json
-{"path": "/data/app/dist.tar.gz", "include_hash": "sha256"}
+{"paths": ["/data/app/bin/server", "/data/app/conf/app.conf"], "include_hash": "sha256", "include_text": true}
 ```
 
 #### `remote_upload_base64` / `remote_download_base64`
@@ -344,55 +375,95 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_search_content`
 
-服务端实现的 RE2 内容搜索——结构化版 `grep -rn`,目标机无需 grep/rg。**无匹配返回空列表而非报错**;自动跳过二进制/超大文件,默认不含隐藏文件。
+服务端实现的 RE2 内容搜索——结构化版 `grep -rn`,目标机无需 grep/rg。**无匹配是成功结果(`files_matched: 0`)而非报错**;文件流式扫描(不整体载入),按行探测 GBK / UTF-8;跳过的文件按原因计数(`skip_reasons`:binary / too_large / unreadable / symlink_dir / outside_roots 等),默认不含隐藏文件。
+
+注意 RE2 的交替是裸 `|`:GNU grep 的 `\|` 在 RE2 里匹配字面量 `|`。这类模式 0 命中时,`hint` 会提示改写;要搜字面文本用 `fixed_strings: true`。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `path` | string | * | 文件或目录(目录递归) |
-| `pattern` | string | * | RE2 正则,如 `"FATAL\|ERROR\|failed"` |
-| `include_glob` | array | | 只搜文件名匹配的文件,如 `["*.conf", "*.log"]` |
+| `path` | string | * | 文件或目录(目录递归;作为 path 传入的目录软链会被跟随) |
+| `pattern` | string | * | RE2 正则,如 `"FATAL\|ERROR\|failed"`(交替用裸竖线) |
+| `output_mode` | string | | `content`(默认,命中行)/ `files_with_matches`(只列文件,同 `grep -l`)/ `count`(每文件命中数,同 `grep -c`) |
+| `include_glob` | array | | 只搜匹配的文件:`*.conf` 匹配文件名,`conf/*.conf`、`**/*.conf` 匹配相对路径,`*.{h,cpp}` 多选 |
+| `exclude_glob` | array | | 跳过匹配的文件和目录(目录不进入),如 `["log", "*.bak*"]` |
 | `ignore_case` | boolean | | 忽略大小写,默认 false |
-| `context_lines` | number | | 每个命中附前后各 N 行,默认 0,最大 20 |
-| `max_results` | number | | 命中上限,默认 200,最大 5000;`truncated` 标记是否有更多 |
-| `max_file_size` | number | | 跳过超过该字节数的文件,默认 32MB |
+| `fixed_strings` | boolean | | 按字面文本搜索(同 `grep -F`),默认 false |
+| `context_lines` | number | | 每个命中附前后各 N 行,默认 0,最大 20;重叠的上下文只输出一次 |
+| `before_lines` / `after_lines` | number | | 分别指定前 / 后行数(同 `grep -B` / `-A`),覆盖 `context_lines` |
+| `max_results` | number | | 每页结果数(命中行或文件),默认 200,最大 5000;输出另有 64KB 上限 |
+| `offset` | number | | 跳过前 N 个结果:截断时传上次的 `next_offset` 翻页 |
+| `max_file_size` | number | | 跳过超过该字节数的文件,默认 256MB |
 | `include_hidden` | boolean | | 包含点文件/点目录,默认 false |
+| `encoding` | string | | 强制源编码,缺省按文件、按行自动探测 |
+| `format` | string | | `json`(默认)或 `text`(同 `grep -n` 的分组输出),见下文「文本格式输出」 |
+
+超长行只返回命中附近约 2000 字节的片段。扫描接近调用预算时提前停止,返回部分结果并在 `hint` 中说明。
 
 ```json
-{"path": "/data/app", "pattern": "FATAL|ERROR", "include_glob": ["*.log"], "context_lines": 2}
+{"path": "/data/app", "pattern": "FATAL|ERROR", "include_glob": ["*.log"], "exclude_glob": ["*.gz"], "before_lines": 3, "after_lines": 1}
 ```
 
 #### `remote_find_files`
 
-按文件名查找——结构化版 `find -name/-iname`,受 FSRoot 约束(杜绝 `find /`),显式返回截断标记。
+按名称、时间、大小查找——结构化版 `find -name/-iname/-newer/-size`,受 FSRoot 约束(杜绝 `find /`),显式返回截断标记。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `path` | string | * | 递归查找的根目录 |
-| `name_glob` | array | | 文件名 glob,如 `["*.cpp", "*.h"]`;留空匹配全部 |
-| `type` | string | | `file` / `dir` / `any`(默认) |
+| `path` | string | * | 递归查找的根目录(作为 path 传入的目录软链会被跟随) |
+| `name_glob` | array | | glob 规则同 `include_glob`,如 `["*.cpp", "*.h"]`、`["conf/**/*.conf"]`;留空匹配全部 |
+| `exclude_glob` | array | | 跳过匹配的条目(目录不进入) |
+| `type` | string | | `file` / `dir` / `symlink` / `any`(默认) |
 | `max_depth` | number | | 最大目录深度(1 = 仅直接子项),默认不限 |
+| `newer_than` / `older_than` | string | | 修改时间晚于 / 早于:RFC3339 时间,或 `30m`、`2h`、`7d` 这类时长 |
+| `min_size` / `max_size` | number | | 文件大小范围(字节);设置后只返回大小符合的普通文件,不返回目录 |
+| `sort_by` | string | | `path`(默认,遍历顺序)/ `mtime`(最新在前)/ `size`(最大在前) |
 | `max_results` | number | | 上限,默认 500,最大 10000;`truncated` 标记是否有更多 |
 | `ignore_case` | boolean | | 忽略大小写(等效 `find -iname`),默认 false |
 | `include_hidden` | boolean | | 包含点文件/点目录,默认 false |
 
 ```json
-{"path": "/data/project", "name_glob": ["*.pem", "*.key"], "type": "file", "max_depth": 4}
+{"path": "/data/app/logs", "name_glob": ["*.log*"], "newer_than": "2h", "sort_by": "mtime", "max_results": 20}
+```
+
+#### `remote_diff`
+
+在服务端比较两个文件或两个目录树,替代 `diff` / `cmp` 和对两套部署逐个 `sha256sum`。
+
+- 两个文件:返回从 `left` 到 `right` 的 unified diff(3 行上下文)。GBK 与 UTF-8 都会先解码,所以只改了编码的文件显示为文本相同,并在 `encoding` 中标出 `utf-8/gbk`。
+- 两个目录:返回相对路径列表,`added`(只在 right)、`removed`(只在 left)、`changed`(两边都有但内容不同,先比大小再比 SHA-256)、`type_changed`,以及相同条目数 `same_count`。`show_diffs: true` 时附带最多 20 个变更文本文件的 diff。
+- 超过 8MB 的文件和二进制文件只比较内容是否相同,不给行级 diff。
+- 目录模式接近调用预算时停止读取文件内容,已比较的结果照常返回,`added` / `removed` 列表仍然完整,并以 `truncated: true` 和 `hint` 说明有多少两侧都存在的文件未比较。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `left` | string | * | 旧文件或目录(`-` 侧) |
+| `right` | string | * | 新文件或目录(`+` 侧) |
+| `ignore_space` | boolean | | 忽略行内空白数量的变化(同 `diff -b`),默认 false |
+| `exclude_glob` | array | | 目录模式:跳过匹配的条目,如 `["log", "*.bak*", "data/**"]` |
+| `include_hidden` | boolean | | 目录模式:包含点文件/点目录,默认 false |
+| `show_diffs` | boolean | | 目录模式:附带变更文本文件的 diff,默认 false |
+| `max_bytes` | number | | diff 文本上限,默认 64KB |
+| `format` | string | | `json`(默认)或 `text`,见下文「文本格式输出」 |
+
+```json
+{"left": "/ssd1/toad_policy_test/toad_policy_old/conf", "right": "/home/work/toadpolicy2dianshang/conf", "exclude_glob": ["*.bak*"], "show_diffs": true}
 ```
 
 #### `remote_tail_log`
 
-读(可能巨大且持续增长的)日志尾部,不载入内存。替代 `tail -n N`、`tail -n +N`(用 `since_line=N-1`)、`sleep 70; tail`(用 `follow_seconds=70`)。支持正则过滤与两种增量游标;轮询推荐 `since_offset`(最省,取上次返回的 `end_offset`);文件轮转(变小)时自动从头重读并置 `rotated=true`。
+读(可能巨大且持续增长的)日志尾部,不载入内存。替代 `tail -n N`、`grep X log | tail -n N`(`lines=N` 加 `filter_regex=X`:从文件尾倒序扫描,返回最后 N 条**匹配行**)、`tail -n +N`(用 `since_line=N-1`)、`sleep 70; tail`(用 `follow_seconds=70`)。支持正则过滤与两种增量游标;轮询推荐 `since_offset`(最省,取上次返回的 `end_offset`);文件轮转(变小)时自动从头重读并置 `rotated=true`。
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `path` | string | * | 日志文件路径 |
-| `lines` | number | | 尾部模式:返回最后 N 行,默认 100,最大 10000 |
-| `filter_regex` | string | | RE2 过滤,只返回匹配行;游标推进不受过滤影响 |
+| `lines` | number | | 尾部模式:返回最后 N 行(带 `filter_regex` 时为最后 N 条匹配行),默认 100,最大 10000 |
+| `filter_regex` | string | | RE2 过滤,只返回匹配行(交替用裸竖线);游标推进不受过滤影响 |
 | `since_line` | number | | 行游标:返回该行号(1 基)之后的行(取上次 `end_line`) |
 | `since_offset` | number | | 字节游标:返回该偏移之后的内容(取上次 `end_offset`),优先于 `since_line` |
 | `follow_seconds` | number | | 最多等待 N 秒新内容(上限为调用预算);无新内容时 `timed_out=true`,用 `since_offset=end_offset` 再调用继续跟 |
 | `encoding` | string | | 源编码,缺省自动探测 |
-| `max_bytes` | number | | 收集内容字节上限,默认 1MB |
+| `max_bytes` | number | | 收集内容字节上限,默认 64KB;字节游标模式下达到上限时在行边界截断,`hint` 给出续读偏移 |
+| `format` | string | | `json`(默认)或 `text`,见下文「文本格式输出」 |
 
 ```json
 {"path": "/data/app/logs/app.log", "filter_regex": "ERROR", "follow_seconds": 60}
@@ -461,9 +532,19 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 ## 安全机制
 
+### 文本格式输出(format=text)
+
+`remote_read_file`、`remote_read_files`、`remote_search_content`、`remote_tail_log`、`remote_diff` 支持 `format: "text"`。默认的 `json` 格式返回结构化结果;`text` 格式先给一行方括号头部(行号范围、字节范围、编码、`truncated`、`next_offset` / `next_start_line` 等游标),后面是纯文本内容:读取结果与 `cat -n` 相同,搜索结果与 `grep -n` 相同(文件名分组,`N:` 为命中行,`N-` 为上下文,不相邻的组之间用 `--` 分隔),目录对比与 `diff -rq` 相近并附 unified diff。
+
+文本格式的结果只含 `text` 内容,不含 `structuredContent`。原因是 Claude Code 在结果带 `structuredContent` 时只把它的 JSON 交给模型,文本内容会被忽略。JSON 里的文件内容要转义换行、制表符和引号,搜索结果的每条命中还要重复文件路径和字段名。按模型实际看到的形式端到端实测:100 条带上下文的搜索结果,文本约为 JSON 的 57%;过滤后的日志尾部约 76%;160 行的读取窗口约 97%(内容本身占大头,主要收益是可读性)。
+
+```json
+{"path": "/data/app/src", "pattern": "set_coupon_rate", "include_glob": ["*.{h,cpp}"], "context_lines": 2, "format": "text"}
+```
+
 ### 只读模式(ReadOnly)
 
-`SHELL_API_READONLY` 是本服务**优先级最高**的开关。开启后服务退化为纯读取代理:只保留 11 个读取类工具,命令执行、会话、写 / 编辑 / 删除 / 移动 / 复制 / 建目录全部下线,且**运行时无法恢复**——它不受 `SHELL_API_DISABLED_TOOLS`、请求参数或任何后续配置影响。
+`SHELL_API_READONLY` 是本服务**优先级最高**的开关。开启后服务退化为纯读取代理:只保留 13 个读取类工具,命令执行、会话、写 / 编辑 / 删除 / 移动 / 复制 / 建目录全部下线,且**运行时无法恢复**——它不受 `SHELL_API_DISABLED_TOOLS`、请求参数或任何后续配置影响。
 
 ```bash
 # 一键开启(取值 1 / true / yes / on / enabled,大小写不敏感)
@@ -487,12 +568,13 @@ SHELL_API_TOKEN=xxx SHELL_API_READONLY=true ./remote-agent-proxy
 
 第 1 层用的是**白名单**(`readonly.go` 的 `readOnlyTools`):将来新增的工具在未被显式审计并加入白名单前一律禁用,漏改代码的后果是"少一个读工具",而不是"多一个写通路"。第 4 层保证即使注册层被绕过(例如后续误加了一个未走 `toolEnabled` 的注册点),底层操作仍然拒绝执行。
 
-只读模式下允许的 11 个工具:
+只读模式下允许的 13 个工具:
 
 ```
-remote_read_file  remote_list_dir  remote_stat  remote_search_content
-remote_find_files  remote_tail_log  remote_download_base64
-remote_list_processes  remote_check_port  remote_get_env_info  remote_status
+remote_read_file  remote_read_files  remote_list_dir  remote_stat
+remote_search_content  remote_find_files  remote_diff  remote_tail_log
+remote_download_base64  remote_list_processes  remote_check_port
+remote_get_env_info  remote_status
 ```
 
 可与黑名单叠加进一步收窄(只能更严,不能更宽):
@@ -503,13 +585,15 @@ SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
 ./remote-agent-proxy      # 最终只剩 9 个工具
 ```
 
-模式对客户端是自描述的:MCP handshake 里 server name 变为 `remote-shell-readonly` 并带上 instructions 说明,`/api/status` 与 `remote_get_env_info` 返回 `read_only: true`,响应头带 `X-Read-Only: true`。
+模式对客户端是自描述的:MCP handshake 里 server name 变为 `remote-shell-readonly`,instructions 写明主机名、FSRoot、可用工具清单和读取约定(分页游标、RE2 交替写法、glob 规则);每个只读工具都带 `readOnlyHint: true` / `destructiveHint: false` 注解(mcp-go 默认是相反值,Claude Code 据此判断工具能否并发执行),`/api/status` 与 `remote_get_env_info` 返回 `read_only: true`,响应头带 `X-Read-Only: true`。
 
 **建议同时设置 `SHELL_API_FS_ROOT`**:只读模式管住"能不能改",FSRoot 管住"能读到哪";两者正交。若要更强的保证,可再用一个对目标目录只有读权限的系统账户运行本服务。
 
 ### 文件沙箱(FSRoot)
 
-`SHELL_API_FS_ROOT` 把**所有文件操作工具**(读 / 写 / 编辑 / 列目录 / stat / 搜索 / 日志 / base64 上传下载 / 移动 / 复制 / 删除 / 建目录)限制在指定目录内。原理是:每次操作前将传入路径解析为绝对路径并 `Clean`(消除 `..`、`./`),再校验它是否落在允许的根目录之下,借此拦截路径穿越(`../../etc/passwd`)和前缀欺骗(`/data/projectxxx`)。
+`SHELL_API_FS_ROOT` 把**所有文件操作工具**(读 / 写 / 编辑 / 列目录 / stat / 搜索 / 日志 / base64 上传下载 / 移动 / 复制 / 删除 / 建目录)限制在指定目录内。原理是:每次操作前将传入路径解析为绝对路径并 `Clean`(消除 `..`、`./`),校验它落在允许的根目录之下,再解析路径上的全部软链接,校验真实路径同样落在根目录(解析后的根目录)之下。借此拦截路径穿越(`../../etc/passwd`)、前缀欺骗(`/data/projectxxx`),以及根目录内指向外部的软链接。
+
+- 软链接本身可以 `remote_stat`(目标在根外时返回 `target_outside_roots: true`,不暴露目标内容)、删除或移动;读取、写入、搜索则按真实路径校验。搜索遍历不进入目录软链:指向根外的文件或目录计入 `skip_reasons.outside_roots`;指向根内的目录软链计入 `symlink_dir` 并列在 `symlink_dirs`(可把该目录作为 `path` 单独搜索)。若某个软链目录确需可读,把它的真实路径加入 `SHELL_API_FS_ROOT`。
 
 - 支持**多个目录前缀**,用逗号分隔;路径只要命中任意一个根目录即放行:
 
@@ -530,7 +614,7 @@ SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
 SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-proxy
 ```
 
-可禁用的工具名即上文列出的 31 个。
+可禁用的工具名即上文列出的 33 个。
 
 如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,拦不住 `/api/execute` 等 REST 端点,漏写一个工具名就留一个写通路。
 

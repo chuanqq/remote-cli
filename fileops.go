@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,16 +25,17 @@ import (
 )
 
 const (
-	defaultReadMaxBytes     = 1048576 // 1MB
 	defaultDownloadMaxBytes = 4194304 // 4MB
 	binarySniffLen          = 8000
 )
 
 // decodeToUTF8 converts raw bytes in the given encoding to a UTF-8 string.
-// Supported: utf-8/"" (returned as-is), gbk, gb2312, gb18030.
+// Supported: utf-8/"" (returned as-is), gbk, gb2312, gb18030, and "unknown"
+// (detectEncoding found no fit): the bytes are kept as-is, so ASCII stays
+// readable and searchable and JSON encoding shows each invalid byte as U+FFFD.
 func decodeToUTF8(data []byte, encoding string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
-	case "", "utf-8", "utf8":
+	case "", "utf-8", "utf8", "unknown":
 		return string(data), nil
 	case "gbk", "gb2312":
 		out, _, err := transform.Bytes(simplifiedchinese.GBK.NewDecoder(), data)
@@ -53,10 +55,12 @@ func decodeToUTF8(data []byte, encoding string) (string, error) {
 }
 
 // encodeFromUTF8 converts a UTF-8 string to bytes in the target encoding.
-// Supported: utf-8/"" (returned as-is), gbk, gb2312, gb18030.
+// Supported: utf-8/"" (returned as-is), gbk, gb2312, gb18030, and "unknown"
+// (bytes as-is: an edit of a file decodeToUTF8 kept raw writes its untouched
+// bytes back unchanged).
 func encodeFromUTF8(s string, encoding string) ([]byte, error) {
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
-	case "", "utf-8", "utf8":
+	case "", "utf-8", "utf8", "unknown":
 		return []byte(s), nil
 	case "gbk", "gb2312":
 		out, _, err := transform.Bytes(simplifiedchinese.GBK.NewEncoder(), []byte(s))
@@ -75,16 +79,195 @@ func encodeFromUTF8(s string, encoding string) ([]byte, error) {
 	}
 }
 
-// detectEncoding does a best-effort guess: valid UTF-8 -> "utf-8",
-// else decodable as GBK -> "gbk", else "unknown".
+// minUTF8Evidence is how many multi-byte UTF-8 characters a line of a GBK
+// file needs to be taken as UTF-8: one or two GBK characters are valid UTF-8
+// surprisingly often ("预" is D4 A4, which UTF-8 reads as "Ԥ"), three or
+// more practically never.
+const minUTF8Evidence = 3
+
+// decodeLine decodes one line (without its newline) to UTF-8. A forced
+// encoding is applied as is. Otherwise ASCII stays as it is; in a file
+// detected as GBK-family the line is decoded as such unless it is valid UTF-8
+// with strong evidence (minUTF8Evidence); in a UTF-8 or unknown file valid
+// UTF-8 stays and anything else is decoded as detected for that line alone,
+// so a GBK comment in a UTF-8 source file still reads right.
+func decodeLine(line []byte, fileEnc, forced string) string {
+	if forced != "" {
+		if s, err := decodeToUTF8(line, forced); err == nil {
+			return s
+		}
+		return string(line)
+	}
+	if isASCII(line) {
+		return string(line)
+	}
+	valid := utf8.Valid(line)
+	enc := fileEnc
+	switch {
+	case isGBFamily(fileEnc):
+		if valid && multiByteRunes(line) >= minUTF8Evidence {
+			return string(line)
+		}
+	case valid:
+		return string(line)
+	default:
+		enc = detectEncoding(line)
+	}
+	if s, err := decodeToUTF8(line, enc); err == nil {
+		return s
+	}
+	return string(line)
+}
+
+// decodeText decodes data, a run of whole lines, to UTF-8: with a forced
+// encoding as one block, else line by line with decodeLine, so lines in
+// another encoding than the file's (detected as fileEnc) still read right.
+func decodeText(data []byte, fileEnc, forced string) (string, error) {
+	if forced != "" {
+		return decodeToUTF8(data, forced)
+	}
+	if !isGBFamily(fileEnc) && utf8.Valid(data) {
+		return string(data), nil
+	}
+	var b strings.Builder
+	b.Grow(len(data) + len(data)/2)
+	for len(data) > 0 {
+		i := bytes.IndexByte(data, '\n')
+		line := data
+		if i >= 0 {
+			line = data[:i]
+		}
+		cr := len(line) > 0 && line[len(line)-1] == '\r'
+		if cr {
+			line = line[:len(line)-1]
+		}
+		b.WriteString(decodeLine(line, fileEnc, ""))
+		if cr {
+			b.WriteByte('\r')
+		}
+		if i < 0 {
+			break
+		}
+		b.WriteByte('\n')
+		data = data[i+1:]
+	}
+	return b.String(), nil
+}
+
+func isASCII(b []byte) bool {
+	for _, c := range b {
+		if c >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// multiByteRunes counts the multi-byte characters of valid UTF-8 b.
+func multiByteRunes(b []byte) int {
+	n := 0
+	for len(b) > 0 {
+		_, size := utf8.DecodeRune(b)
+		if size > 1 {
+			n++
+		}
+		b = b[size:]
+	}
+	return n
+}
+
+// detectEncoding guesses the encoding of data, which is often a window cut
+// out of a larger file (max_bytes, offset_bytes, a tail block): an incomplete
+// UTF-8 sequence at either edge does not count against UTF-8, and neither do
+// a few stray invalid bytes in otherwise valid UTF-8 text. GBK wins only when
+// the high bytes pair up as GBK characters. The GBK decoder never fails (it
+// substitutes U+FFFD), so "decodes as GBK" is no evidence at all: an earlier
+// version used it as the test and turned every cut UTF-8 window into mojibake.
+// Returns "utf-8", "gbk" or "unknown" (neither fits; decoded as raw bytes).
 func detectEncoding(data []byte) string {
-	if utf8.Valid(data) {
+	s, e := utf8Edges(data)
+	t := data[s:e]
+	if utf8.Valid(t) {
 		return "utf-8"
 	}
-	if _, _, err := transform.Bytes(simplifiedchinese.GBK.NewDecoder(), data); err == nil {
+	// A stray byte in UTF-8 text breaks GBK pairing at least as often as it
+	// breaks UTF-8, while GBK text is mostly invalid as UTF-8. Random high
+	// bytes pair up as GBK about 3 times in 4, so GBK must be near-clean.
+	ug, ub := utf8Sequences(t)
+	gg, gb := gbkPairs(data)
+	switch {
+	case ug > 0 && (ub*50 <= ug || ub <= gb):
+		return "utf-8"
+	case gg > 0 && gb*20 <= gg && gb < ub:
 		return "gbk"
 	}
 	return "unknown"
+}
+
+// utf8Edges returns the bounds of data without a partial UTF-8 sequence cut
+// off at either end (UTF-8 resynchronizes within 3 bytes).
+func utf8Edges(data []byte) (start, end int) {
+	end = len(data)
+	for start < end && start < utf8.UTFMax-1 && !utf8.RuneStart(data[start]) {
+		start++
+	}
+	for i := end - 1; i >= start && i >= end-utf8.UTFMax; i-- {
+		if utf8.RuneStart(data[i]) {
+			if !utf8.FullRune(data[i:end]) {
+				end = i
+			}
+			break
+		}
+	}
+	return start, end
+}
+
+// isGBFamily reports whether encoding is gbk, gb2312 or gb18030.
+func isGBFamily(encoding string) bool {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "gbk", "gb2312", "gb18030":
+		return true
+	}
+	return false
+}
+
+// utf8Sequences counts valid multi-byte UTF-8 sequences and invalid bytes.
+func utf8Sequences(data []byte) (good, bad int) {
+	for len(data) > 0 {
+		r, size := utf8.DecodeRune(data)
+		switch {
+		case r == utf8.RuneError && size == 1:
+			bad++
+		case size > 1:
+			good++
+		}
+		data = data[size:]
+	}
+	return good, bad
+}
+
+// gbkPairs counts high bytes that form a GBK double-byte character (lead
+// 0x81-0xFE, trail 0x40-0xFE except 0x7F) and high bytes that do not. A lead
+// byte that ends data is neither: the window was cut inside that character.
+func gbkPairs(data []byte) (good, bad int) {
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if b < 0x80 {
+			continue
+		}
+		if b >= 0x81 && b <= 0xFE {
+			if i+1 == len(data) {
+				break
+			}
+			if t := data[i+1]; t >= 0x40 && t <= 0xFE && t != 0x7F {
+				good++
+				i++
+				continue
+			}
+		}
+		bad++
+	}
+	return good, bad
 }
 
 // looksBinary reports whether the first bytes contain a NUL (0x00).
@@ -102,8 +285,11 @@ func looksBinary(data []byte) bool {
 }
 
 // validatePath resolves path to an absolute cleaned path. When roots is
-// non-empty, the resolved path must stay within at least one of the roots
-// (sandbox). An empty roots slice means no filesystem restriction.
+// non-empty, the path must stay within at least one of the roots (sandbox),
+// both as written and with its symlinks resolved: a link inside a root that
+// points outside it would otherwise let reads, and writes, escape. An empty
+// roots slice means no filesystem restriction. The path is returned as
+// written (absolute, cleaned), not resolved.
 func validatePath(path string, roots []string) (string, error) {
 	if path == "" {
 		return "", errors.New("path is empty")
@@ -116,13 +302,130 @@ func validatePath(path string, roots []string) (string, error) {
 	if len(roots) == 0 {
 		return abs, nil
 	}
+	if !underRoots(abs, roots) {
+		return "", errors.New("path escapes allowed roots")
+	}
+	real, err := resolvePath(abs, 0)
+	if err != nil {
+		return "", resolveError(abs, err)
+	}
+	// The messages name only the caller's own path: where a link leads
+	// outside the roots is not for the caller to learn (remote_stat shows
+	// the link target itself).
+	if real != abs && !underRoots(real, resolveRoots(roots)) {
+		return "", fmt.Errorf("path escapes allowed roots: %s leads through a symlink outside them "+
+			"(to read there, add the target directory to SHELL_API_FS_ROOT)", abs)
+	}
+	return abs, nil
+}
+
+// resolveError reports a failure to resolve abs without the path it failed
+// on, which may lie outside the roots.
+func resolveError(abs string, err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err
+	}
+	return fmt.Errorf("cannot resolve %s: %v", abs, err)
+}
+
+// validateLinkPath is validatePath for operations on a path itself rather
+// than on what it points to (stat, delete, rename): its final component may
+// be a symlink leading anywhere, but its parent directories must resolve
+// inside the roots.
+func validateLinkPath(path string, roots []string) (string, error) {
+	if path == "" {
+		return "", errors.New("path is empty")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	if len(roots) == 0 {
+		return abs, nil
+	}
+	if !underRoots(abs, roots) {
+		return "", errors.New("path escapes allowed roots")
+	}
 	for _, root := range roots {
-		cleanRoot := filepath.Clean(root)
-		if abs == cleanRoot || strings.HasPrefix(abs, cleanRoot+string(os.PathSeparator)) {
+		if abs == filepath.Clean(root) {
 			return abs, nil
 		}
 	}
-	return "", errors.New("path escapes allowed roots")
+	parent, err := resolvePath(filepath.Dir(abs), 0)
+	if err != nil {
+		return "", resolveError(abs, err)
+	}
+	if !underRoots(parent, resolveRoots(roots)) {
+		return "", fmt.Errorf("path escapes allowed roots: the directory of %s leads through a symlink outside them", abs)
+	}
+	return abs, nil
+}
+
+// underRoots reports whether path is one of roots or lies below one.
+func underRoots(path string, roots []string) bool {
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		prefix := root
+		if !strings.HasSuffix(prefix, string(os.PathSeparator)) {
+			prefix += string(os.PathSeparator)
+		}
+		if path == root || strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveRoots returns roots with their symlinks resolved (a missing root is
+// resolved as far as it exists, like a write target).
+func resolveRoots(roots []string) []string {
+	out := make([]string, len(roots))
+	for i, root := range roots {
+		if real, err := resolvePath(filepath.Clean(root), 0); err == nil {
+			out[i] = real
+		} else {
+			out[i] = filepath.Clean(root)
+		}
+	}
+	return out
+}
+
+// maxSymlinkHops bounds how many dangling symlinks resolvePath follows.
+const maxSymlinkHops = 40
+
+// resolvePath resolves every symlink in path, which may not exist yet (a write
+// target): missing trailing components are kept as written, while a dangling
+// symlink is followed to where it points, since writing through it would
+// create its target.
+func resolvePath(path string, hops int) (string, error) {
+	real, err := filepath.EvalSymlinks(path)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return real, err
+	}
+	if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if hops >= maxSymlinkHops {
+			return "", errors.New("too many levels of symbolic links")
+		}
+		target, rerr := os.Readlink(path)
+		if rerr != nil {
+			return "", rerr
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		return resolvePath(filepath.Clean(target), hops+1)
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path, nil
+	}
+	rp, err := resolvePath(parent, hops)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(rp, filepath.Base(path)), nil
 }
 
 // parseMode parses an octal mode string, defaulting to 0644 when empty.
@@ -153,8 +456,8 @@ type WriteFileResult struct {
 	BytesWritten int         `json:"bytes_written"`
 	Created      bool        `json:"created"` // whether the file did not exist before
 	Encoding     string      `json:"encoding"`
-	SHA256       string      `json:"sha256"`          // digest of the bytes written this call
-	Mode         string      `json:"mode"`            // resulting permission bits, e.g. "0644"
+	SHA256       string      `json:"sha256"`         // digest of the bytes written this call
+	Mode         string      `json:"mode"`           // resulting permission bits, e.g. "0644"
 	Lint         *LintResult `json:"lint,omitempty"` // only when lint requested
 	// DryRun: nothing was written; bytes_written / sha256 / created / mode
 	// describe what the write would do, and Preview shows the change.
@@ -348,168 +651,6 @@ func encodedResult(old, data []byte, appendMode bool) []byte {
 	return data
 }
 
-type ReadFileRequest struct {
-	Path         string
-	Encoding     string // source encoding; empty auto-detects
-	StartLine    int    // 1-based, 0 or negative means from start
-	EndLine      int    // 1-based inclusive; 0 or negative means to end
-	MaxBytes     int    // read cap, 0 uses default 1MB
-	TailLines    int    // >0: read the last N lines (seek-based, wins over line range)
-	OffsetBytes  int64  // start reading at this byte offset
-	TruncateMode string // "head" (default) keeps the first max_bytes; "tail" keeps the last
-}
-
-type ReadFileResult struct {
-	Path          string `json:"path"`
-	Content       string `json:"content"`  // UTF-8
-	Encoding      string `json:"encoding"` // actual source encoding used
-	IsBinary      bool   `json:"is_binary"`
-	Truncated     bool   `json:"truncated"`
-	TotalLines    int    `json:"total_lines,omitempty"`
-	ReturnedLines int    `json:"returned_lines,omitempty"`
-	TotalSize     int64  `json:"total_size"` // file size in bytes
-	Offset        int64  `json:"offset"`     // byte offset the returned content starts at
-}
-
-// readHeadBytes reads up to maxBytes from the current position of f.
-func readHeadBytes(f *os.File, maxBytes int) ([]byte, error) {
-	buf := make([]byte, maxBytes)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, err
-	}
-	return buf[:n], nil
-}
-
-// ReadFileContent reads a file, decodes it to UTF-8, and optionally slices
-// by 1-based line range or tail line count. Reads are seek/limit based so
-// large files are never loaded wholesale. Binary files are reported without
-// decoding.
-func ReadFileContent(req ReadFileRequest, roots []string) (*ReadFileResult, error) {
-	abs, err := validatePath(req.Path, roots)
-	if err != nil {
-		return nil, err
-	}
-
-	f, err := os.Open(abs)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.IsDir() {
-		return nil, errors.New("path is a directory, use remote_list_dir")
-	}
-	totalSize := info.Size()
-
-	maxBytes := req.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = defaultReadMaxBytes
-	}
-
-	result := &ReadFileResult{Path: abs, TotalSize: totalSize}
-
-	var data []byte
-
-	switch {
-	case req.TailLines > 0:
-		// Seek-based tail: last N lines without reading the whole file.
-		var capped bool
-		data, result.Offset, capped, err = readTailBytes(f, totalSize, req.TailLines, maxBytes)
-		if err != nil {
-			return nil, err
-		}
-		// Consistent with head-mode semantics: the returned window does not
-		// cover the whole file (either by design or by byte cap).
-		result.Truncated = capped || result.Offset > 0
-
-	case req.StartLine > 0 || req.EndLine > 0:
-		// Line-range mode: cap from the head, then slice by line numbers.
-		data, err = readHeadBytes(f, maxBytes)
-		if err != nil {
-			return nil, err
-		}
-		result.Truncated = totalSize > int64(len(data))
-
-	default:
-		offset := req.OffsetBytes
-		if offset < 0 {
-			offset = 0
-		}
-		if strings.EqualFold(req.TruncateMode, "tail") && totalSize-int64(maxBytes) > offset {
-			offset = totalSize - int64(maxBytes)
-		}
-		if offset > totalSize {
-			offset = totalSize
-		}
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return nil, err
-		}
-		data, err = readHeadBytes(f, maxBytes)
-		if err != nil {
-			return nil, err
-		}
-		result.Offset = offset
-		result.Truncated = offset+int64(len(data)) < totalSize
-	}
-
-	if looksBinary(data) {
-		result.IsBinary = true
-		result.Content = "<binary file, use remote_download_base64>"
-		return result, nil
-	}
-
-	encoding := req.Encoding
-	if encoding == "" {
-		encoding = detectEncoding(data)
-	}
-	content, err := decodeToUTF8(data, encoding)
-	if err != nil {
-		return nil, err
-	}
-	result.Encoding = encoding
-
-	switch {
-	case req.StartLine > 0 || req.EndLine > 0:
-		// Slice by line range only when requested.
-		lines := strings.Split(content, "\n")
-		total := len(lines)
-		result.TotalLines = total
-
-		start := req.StartLine
-		if start <= 0 {
-			start = 1
-		}
-		end := req.EndLine
-		if end <= 0 || end > total {
-			end = total
-		}
-		if start > total || start > end {
-			result.Content = ""
-			result.ReturnedLines = 0
-			return result, nil
-		}
-		selected := lines[start-1 : end]
-		result.Content = strings.Join(selected, "\n")
-		result.ReturnedLines = len(selected)
-	case req.TailLines > 0:
-		lines := splitLinesRaw([]byte(content))
-		if len(lines) > req.TailLines {
-			lines = lines[len(lines)-req.TailLines:]
-		}
-		result.Content = strings.Join(lines, "\n")
-		result.ReturnedLines = len(lines)
-	default:
-		result.Content = content
-	}
-
-	return result, nil
-}
-
 type EditPair struct {
 	OldString  string `json:"old_string"`
 	NewString  string `json:"new_string"`
@@ -688,10 +829,12 @@ type ListDirRequest struct {
 	IncludeHidden bool     // include dot-files
 }
 
+// ListDirResult puts the entries last, so a client that cuts an oversized
+// result keeps the count.
 type ListDirResult struct {
 	Path    string     `json:"path"`
-	Entries []DirEntry `json:"entries"`
 	Count   int        `json:"count"`
+	Entries []DirEntry `json:"entries"`
 }
 
 // ListDirectory lists the entries of a directory with metadata including
@@ -707,13 +850,17 @@ func ListDirectory(req ListDirRequest, roots []string) (*ListDirResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	filter, err := compileGlobs(req.FilterGlob, false)
+	if err != nil {
+		return nil, fmt.Errorf("filter_glob: %w", err)
+	}
 
 	entries := make([]DirEntry, 0, len(dirEntries))
 	for _, de := range dirEntries {
 		if !req.IncludeHidden && isHiddenName(de.Name()) {
 			continue
 		}
-		if !matchAnyGlob(de.Name(), req.FilterGlob, false) {
+		if !filter.match(de.Name(), de.Name(), filepath.Join(abs, de.Name())) {
 			continue
 		}
 		info, infoErr := de.Info() // follows symlinks: IsDir reflects the target
@@ -780,6 +927,19 @@ type StatRequest struct {
 	Path            string
 	IncludeHash     string // "md5" | "sha256" | "" (none)
 	IncludeEncoding bool   // detect text encoding of regular files
+	IncludeText     bool   // text facts of regular files: line count, line endings, BOM (wc -l / file)
+}
+
+// TextInfo holds the text facts of a regular file (remote_stat include_text):
+// what `wc -l`, `file` and a BOM/CRLF probe used to be run for.
+type TextInfo struct {
+	Lines        int    `json:"lines"`                  // like wc -l, plus a final line without a newline
+	LineEndings  string `json:"line_endings,omitempty"` // "lf" | "crlf" | "mixed" | "cr" | "none"
+	FinalNewline bool   `json:"final_newline"`
+	BOM          string `json:"bom,omitempty"` // "utf-8" | "utf-16le" | "utf-16be"
+	Encoding     string `json:"encoding,omitempty"`
+	MaxLineLen   int    `json:"max_line_length"` // bytes
+	Skipped      string `json:"skipped,omitempty"`
 }
 
 type StatResult struct {
@@ -795,10 +955,15 @@ type StatResult struct {
 	Nlink         uint64 `json:"nlink,omitempty"`
 	IsSymlink     bool   `json:"is_symlink,omitempty"`
 	SymlinkTarget string `json:"symlink_target,omitempty"`
-	Encoding      string `json:"encoding,omitempty"`   // only when include_encoding=true
-	Hash          string `json:"hash,omitempty"`       // hex digest, only when include_hash set
-	HashAlgo      string `json:"hash_algo,omitempty"`  // "md5" | "sha256"
-	HashSkipped   bool   `json:"hash_skipped,omitempty"` // file exceeded the hash size cap
+	// TargetOutsideRoots: the path is a symlink whose target lies outside the
+	// FS roots; only the link itself is described.
+	TargetOutsideRoots bool      `json:"target_outside_roots,omitempty"`
+	Encoding           string    `json:"encoding,omitempty"`     // only when include_encoding=true
+	Hash               string    `json:"hash,omitempty"`         // hex digest, only when include_hash set
+	HashAlgo           string    `json:"hash_algo,omitempty"`    // "md5" | "sha256"
+	HashSkipped        bool      `json:"hash_skipped,omitempty"` // file exceeded the hash size cap
+	Text               *TextInfo `json:"text,omitempty"`         // only when include_text=true
+	Error              string    `json:"error,omitempty"`        // multi-path stat: why this path failed
 }
 
 // maxStatHashBytes caps files eligible for content hashing.
@@ -808,7 +973,7 @@ const maxStatHashBytes = 256 << 20 // 256MB
 // detected encoding. A missing path yields Exists:false without an error.
 // Symlinks are reported as themselves (Lstat) with their target.
 func StatFile(req StatRequest, roots []string) (*StatResult, error) {
-	abs, err := validatePath(req.Path, roots)
+	abs, err := validateLinkPath(req.Path, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -829,6 +994,16 @@ func StatFile(req StatRequest, roots []string) (*StatResult, error) {
 	if result.IsSymlink {
 		if target, linkErr := os.Readlink(abs); linkErr == nil {
 			result.SymlinkTarget = target
+		}
+		// The link itself may be stat'ed, but a target outside the roots is
+		// reported as the link alone: its content (hash, encoding) and its
+		// metadata stay out of reach.
+		if _, err := validatePath(abs, roots); err != nil {
+			result.Size = info.Size()
+			result.Mode = info.Mode().String()
+			result.ModTime = info.ModTime().Format(time.RFC3339)
+			result.TargetOutsideRoots = true
+			return result, nil
 		}
 	}
 
@@ -881,8 +1056,109 @@ func StatFile(req StatRequest, roots []string) (*StatResult, error) {
 	if req.IncludeEncoding && !result.IsBinary {
 		result.Encoding = detectEncoding(head)
 	}
+	if req.IncludeText {
+		result.Text = textInfo(abs, statInfo.Size(), result.IsBinary, head)
+	}
 
 	return result, nil
+}
+
+// maxTextScanBytes caps files scanned for include_text.
+const maxTextScanBytes = 256 << 20
+
+// textInfo scans a regular file for its line count, line endings and BOM.
+func textInfo(path string, size int64, binary bool, head []byte) *TextInfo {
+	ti := &TextInfo{}
+	switch {
+	case binary:
+		ti.Skipped = "binary file"
+		return ti
+	case size > maxTextScanBytes:
+		ti.Skipped = fmt.Sprintf("larger than %d MB", maxTextScanBytes>>20)
+		return ti
+	}
+	switch {
+	case bytes.HasPrefix(head, []byte{0xEF, 0xBB, 0xBF}):
+		ti.BOM = "utf-8"
+	case bytes.HasPrefix(head, []byte{0xFF, 0xFE}):
+		ti.BOM = "utf-16le"
+	case bytes.HasPrefix(head, []byte{0xFE, 0xFF}):
+		ti.BOM = "utf-16be"
+	}
+	ti.Encoding = detectEncoding(head)
+	f, err := os.Open(path)
+	if err != nil {
+		ti.Skipped = err.Error()
+		return ti
+	}
+	defer f.Close()
+	var lf, crlf, cr, lineLen int
+	var prev, last byte
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := f.Read(buf)
+		for _, c := range buf[:n] {
+			switch c {
+			case '\n':
+				lf++
+				if prev == '\r' {
+					crlf++
+				}
+				ti.MaxLineLen = max(ti.MaxLineLen, lineLen)
+				lineLen = 0
+			case '\r':
+			default:
+				if prev == '\r' {
+					cr++
+				}
+				lineLen++
+			}
+			prev, last = c, c
+		}
+		if err != nil {
+			break
+		}
+	}
+	ti.MaxLineLen = max(ti.MaxLineLen, lineLen)
+	ti.Lines = lf
+	ti.FinalNewline = last == '\n'
+	if size > 0 && !ti.FinalNewline {
+		ti.Lines++
+	}
+	switch {
+	case lf == 0 && cr == 0:
+		ti.LineEndings = "none"
+	case cr > 0 && lf == 0:
+		ti.LineEndings = "cr"
+	case crlf == lf && cr == 0:
+		ti.LineEndings = "crlf"
+	case crlf == 0 && cr == 0:
+		ti.LineEndings = "lf"
+	default:
+		ti.LineEndings = "mixed"
+	}
+	return ti
+}
+
+// maxStatPaths bounds a multi-path remote_stat call.
+const maxStatPaths = 200
+
+// StatFiles stats several paths; a failing path carries its error in place.
+func StatFiles(paths []string, req StatRequest, roots []string) ([]*StatResult, error) {
+	if len(paths) > maxStatPaths {
+		return nil, fmt.Errorf("paths: at most %d per call, got %d", maxStatPaths, len(paths))
+	}
+	out := make([]*StatResult, 0, len(paths))
+	for _, p := range paths {
+		r := req
+		r.Path = p
+		st, err := StatFile(r, roots)
+		if err != nil {
+			st = &StatResult{Path: p, Error: err.Error()}
+		}
+		out = append(out, st)
+	}
+	return out, nil
 }
 
 // hashFile streams a file through the named hash algorithm.
@@ -996,13 +1272,15 @@ type DownloadBase64Request struct {
 	MaxBytes int   // max bytes this call, 0 uses default (4MB)
 }
 
+// DownloadBase64Result puts the payload last, so a client that cuts an
+// oversized result keeps total_size / eof and can ask for smaller chunks.
 type DownloadBase64Result struct {
 	Path      string `json:"path"`
-	DataB64   string `json:"data_b64"`
 	BytesRead int    `json:"bytes_read"`
 	Offset    int64  `json:"offset"`
 	TotalSize int64  `json:"total_size"`
 	EOF       bool   `json:"eof"` // whether the end of file was reached
+	DataB64   string `json:"data_b64"`
 }
 
 // DownloadBase64 reads a byte range from a file starting at Offset and

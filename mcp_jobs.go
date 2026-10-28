@@ -85,7 +85,7 @@ func registerJobTools(s *server.MCPServer, jobs *JobManager, cfg *Config) {
 		s.AddTool(mcp.NewTool("remote_job_logs",
 			mcp.WithDescription("Read the combined stdout/stderr log of a background job. Same cursor model as remote_tail_log: last N lines by default; pass since_offset=end_offset from the previous call to read only new output, and follow_seconds to wait for it. The response includes the job state."),
 			mcp.WithString("job_id", mcp.Required(), mcp.Description("Job ID returned by remote_spawn.")),
-			mcp.WithNumber("lines", mcp.Description("Tail mode: return the last N lines. Default 100.")),
+			mcp.WithNumber("lines", mcp.Description("Tail mode: return the last N lines (with filter_regex: the last N matching lines). Default 100.")),
 			mcp.WithNumber("since_offset", mcp.Description("Byte cursor: return output after this offset (end_offset of the previous call).")),
 			mcp.WithNumber("follow_seconds", mcp.Description(fmt.Sprintf("While the job runs, wait up to N seconds (max %d, the call budget) for new output; call again with since_offset=end_offset to keep following.", cfg.callBudgetSec()))),
 			mcp.WithString("filter_regex", mcp.Description("RE2: return only matching lines.")),

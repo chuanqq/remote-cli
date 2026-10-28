@@ -328,3 +328,52 @@ func TestWriteFileSelfCheck(t *testing.T) {
 		}
 	}
 }
+
+// include_text: line count like wc -l (plus an unterminated last line), line
+// endings, BOM; paths[] stats several paths with per-path errors.
+func TestStatTextAndMultiPath(t *testing.T) {
+	root := t.TempDir()
+	roots := []string{root}
+	write := func(name string, data []byte) string {
+		p := filepath.Join(root, name)
+		os.WriteFile(p, data, 0644)
+		return p
+	}
+	lf := write("lf.conf", []byte("a\nb\nc\n"))
+	crlf := write("crlf.bat", []byte("a\r\nbb\r\n"))
+	mixed := write("mixed.txt", []byte("a\r\nb\nc"))
+	bom := write("bom.py", append([]byte{0xEF, 0xBB, 0xBF}, []byte("x = 1\n")...))
+
+	cases := []struct {
+		path    string
+		lines   int
+		endings string
+		final   bool
+		bom     string
+	}{
+		{lf, 3, "lf", true, ""},
+		{crlf, 2, "crlf", true, ""},
+		{mixed, 3, "mixed", false, ""},
+		{bom, 1, "lf", true, "utf-8"},
+	}
+	for _, c := range cases {
+		st, err := StatFile(StatRequest{Path: c.path, IncludeText: true}, roots)
+		if err != nil || st.Text == nil {
+			t.Fatalf("%s: %v %+v", c.path, err, st)
+		}
+		if st.Text.Lines != c.lines || st.Text.LineEndings != c.endings || st.Text.FinalNewline != c.final || st.Text.BOM != c.bom {
+			t.Errorf("%s: %+v", filepath.Base(c.path), st.Text)
+		}
+	}
+	if st, _ := StatFile(StatRequest{Path: crlf, IncludeText: true}, roots); st.Text.MaxLineLen != 2 {
+		t.Errorf("max_line_length=%d, want 2", st.Text.MaxLineLen)
+	}
+
+	res, err := StatFiles([]string{lf, filepath.Join(root, "missing"), "/etc/hosts"}, StatRequest{IncludeHash: "md5"}, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 3 || !res[0].Exists || res[0].Hash == "" || res[1].Exists || res[1].Error != "" || res[2].Error == "" {
+		t.Errorf("multi-path: %+v %+v %+v", res[0], res[1], res[2])
+	}
+}

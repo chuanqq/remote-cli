@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +12,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 // withReadOnly latches read-only mode for the duration of a test and clears it
@@ -399,5 +404,67 @@ func TestEveryMutatingFuncIsGuarded(t *testing.T) {
 				"(add the guard, or document it in allowedHelpers if its callers are guarded)",
 				file, name)
 		}
+	}
+}
+
+// Under read-only mode every registered tool must be annotated as a pure
+// read: clients (Claude Code) treat an unannotated tool as destructive and
+// never run it in parallel. The handshake must name the host, the FS roots
+// and the RE2 alternation rule.
+func TestReadOnlyToolAnnotationsAndInstructions(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{MaxTimeout: 30, MaxOutput: 4096, DefaultShell: "bash", JobDir: t.TempDir(),
+		DisabledTools: map[string]bool{}, RateLimit: 120, RateBurst: 60, FSRoots: []string{root}}
+	cfg.applyReadOnly(true)
+	t.Cleanup(func() { readOnlyEnabled.Store(false) })
+
+	// List the tools through the real handler, so tools registered directly
+	// in NewMCPHandler (remote_status) are covered too.
+	h := NewMCPHandler(NewExecutor(cfg), &SessionManager{}, testJobManager(t), NewWaitManager(),
+		NewAuditLogger(newLogger(io.Discard, "info")), cfg)
+	post := func(sid, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if sid != "" {
+			req.Header.Set(server.HeaderKeySessionID, sid)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	init := post("", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
+	sid := init.Header().Get(server.HeaderKeySessionID)
+	post(sid, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	var list struct {
+		Result struct {
+			Tools []mcp.Tool `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(post(sid, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`).Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Result.Tools) != len(readOnlyTools) {
+		t.Errorf("listed %d tools, want the %d read-only ones", len(list.Result.Tools), len(readOnlyTools))
+	}
+	for _, tool := range list.Result.Tools {
+		a := tool.Annotations
+		if a.ReadOnlyHint == nil || !*a.ReadOnlyHint || a.DestructiveHint == nil || *a.DestructiveHint {
+			t.Errorf("%s: annotations %+v, want readOnlyHint=true destructiveHint=false", tool.Name, a)
+		}
+	}
+	if !strings.Contains(init.Body.String(), root) {
+		t.Errorf("handshake does not name the FS root: %s", init.Body.String())
+	}
+
+	ins := readOnlyInstructions(cfg)
+	host, _ := os.Hostname()
+	for _, want := range []string{host, root, "RE2", "next_offset", "remote_read_file"} {
+		if !strings.Contains(ins, want) {
+			t.Errorf("read-only instructions lack %q: %s", want, ins)
+		}
+	}
+	if strings.Contains(ins, "remote_execute") {
+		t.Errorf("read-only instructions list a disabled tool: %s", ins)
 	}
 }

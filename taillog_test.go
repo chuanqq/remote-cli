@@ -188,3 +188,105 @@ func TestTailLogBinary(t *testing.T) {
 		t.Errorf("binary not detected: %+v", res)
 	}
 }
+
+// With filter_regex, tail mode returns the last N MATCHING lines (grep X |
+// tail -N), not the matches among the last N lines.
+func TestTailLogFilterLastMatches(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "app.log")
+	var sb strings.Builder
+	for i := 1; i <= 20000; i++ {
+		if i%50 == 0 {
+			sb.WriteString("ERROR #" + strconv.Itoa(i) + " 扣费失败\n")
+		} else {
+			sb.WriteString("INFO " + strconv.Itoa(i) + " 计费请求处理完成 " + strings.Repeat("x", 40) + "\n")
+		}
+	}
+	os.WriteFile(target, []byte(sb.String()), 0644)
+
+	res, err := TailLog(TailLogRequest{Path: target, Lines: 10, FilterRegex: "ERROR"}, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(res.Content, "\n")
+	if len(lines) != 10 || lines[0] != "ERROR #19550 扣费失败" || lines[9] != "ERROR #20000 扣费失败" {
+		t.Errorf("last 10 matches: %q", res.Content)
+	}
+	if !res.Filtered || res.Truncated || res.EndOffset != res.Size || res.Encoding != "utf-8" {
+		t.Errorf("flags: %+v", res)
+	}
+	// start_offset points at the first returned line.
+	if got := sb.String()[res.StartOffset:]; !strings.HasPrefix(got, "ERROR #19550") {
+		t.Errorf("start_offset=%d points at %q", res.StartOffset, got[:20])
+	}
+
+	// Fewer matches than asked for: all of them, not truncated.
+	res, _ = TailLog(TailLogRequest{Path: target, Lines: 1000, FilterRegex: "#1000 "}, []string{root})
+	if res.Content != "ERROR #1000 扣费失败" || res.Truncated {
+		t.Errorf("single match: %q truncated=%v", res.Content, res.Truncated)
+	}
+
+	// A GBK log is decoded line by line.
+	gbk, _ := encodeFromUTF8("INFO 正常\nERROR 扣费失败\nINFO 正常\n", "gbk")
+	os.WriteFile(target, gbk, 0644)
+	res, _ = TailLog(TailLogRequest{Path: target, Lines: 5, FilterRegex: "扣费"}, []string{root})
+	if res.Content != "ERROR 扣费失败" || res.Encoding != "gbk" {
+		t.Errorf("gbk: %q enc=%s", res.Content, res.Encoding)
+	}
+
+	// A last line without a final newline still counts.
+	os.WriteFile(target, []byte("ERROR a\nINFO b\nERROR c"), 0644)
+	res, _ = TailLog(TailLogRequest{Path: target, Lines: 5, FilterRegex: "ERROR"}, []string{root})
+	if res.Content != "ERROR a\nERROR c" {
+		t.Errorf("unterminated last line: %q", res.Content)
+	}
+}
+
+// A filter written with GNU grep's \| matches nothing in RE2: say so.
+func TestTailLogGNUAlternationHint(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "app.log")
+	os.WriteFile(target, []byte("INFO a\nFATAL b\n"), 0644)
+	res, err := TailLog(TailLogRequest{Path: target, Lines: 10, FilterRegex: `FATAL\|ERROR`}, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "" || !strings.Contains(res.Hint, "bare |") {
+		t.Errorf("GNU alternation hint missing: %+v", res)
+	}
+}
+
+// A since_line read cut by max_bytes must hand back a cursor that resumes
+// after the returned lines, not after the whole file.
+func TestTailLogSinceLineTruncatedCursor(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "app.log")
+	writeLines(t, target, 1000)
+	res, err := TailLog(TailLogRequest{Path: target, SinceLine: 1, MaxBytes: 200}, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := len(strings.Split(res.Content, "\n"))
+	if !res.Truncated || res.EndLine != 1+n || res.TotalLines != 1000 || !strings.Contains(res.Hint, "since_line=") {
+		t.Fatalf("truncated cursor: lines=%d %+v", n, res)
+	}
+	next, _ := TailLog(TailLogRequest{Path: target, SinceLine: res.EndLine, MaxBytes: 200}, []string{root})
+	if !strings.HasPrefix(next.Content, "log line "+strconv.Itoa(res.EndLine+1)+"\n") {
+		t.Errorf("resume: %q", next.Content[:30])
+	}
+}
+
+// Mixed encodings: each line of the tail is decoded on its own.
+func TestTailLogMixedEncodingLines(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "app.log")
+	gbk, _ := encodeFromUTF8("ERROR 扣费失败", "gbk")
+	os.WriteFile(target, append([]byte("INFO 计费请求处理完成\n"), append(gbk, '\n')...), 0644)
+	res, err := TailLog(TailLogRequest{Path: target, Lines: 5}, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Content != "INFO 计费请求处理完成\nERROR 扣费失败" {
+		t.Errorf("mixed lines: %q", res.Content)
+	}
+}

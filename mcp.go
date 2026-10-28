@@ -32,18 +32,7 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 		// them) know upfront that no write tool exists, instead of discovering
 		// it by a failed call.
 		name = "remote-shell-readonly"
-		opts = append(opts, server.WithInstructions(
-			"This server runs in READ-ONLY mode. Only inspection tools are available: "+
-				"file reads (remote_read_file, remote_list_dir, remote_stat, remote_search_content, "+
-				"remote_find_files, remote_tail_log, remote_download_base64) and host introspection "+
-				"(remote_list_processes, remote_check_port, remote_get_env_info, remote_status). "+
-				"Shell execution, sessions, and every write/edit/delete/move/copy/mkdir tool are "+
-				"disabled and cannot be re-enabled at runtime. Do not attempt to modify the host; "+
-				"if a change is required, report the exact command or diff for a human to apply. "+
-				fmt.Sprintf("Limits: one call blocks at most %ds (remote_tail_log follow_seconds is capped to it); "+
-					"rate limit %d requests/min per client host, burst %d (HTTP 429 carries retry_after_ms).",
-					cfg.callBudgetSec(), cfg.RateLimit, cfg.RateBurst),
-		))
+		opts = append(opts, server.WithInstructions(readOnlyInstructions(cfg)))
 	}
 	s := server.NewMCPServer(name, fullVersion(), opts...)
 	startTime := time.Now()
@@ -216,6 +205,7 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 
 	if cfg.toolEnabled("remote_status") {
 		s.AddTool(mcp.NewTool("remote_status",
+			readOnlyHints(),
 			mcp.WithDescription("Return server health, version, uptime, active session count, and system information."),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			hostname, _ := os.Hostname()
@@ -273,6 +263,43 @@ func serverInstructions(cfg *Config) string {
 		b.WriteString("Some commands are denied by server policy (see remote_get_env_info deny_commands). ")
 	}
 	b.WriteString("remote_get_env_info returns the full profile (tools, versions, limits).")
+	return b.String()
+}
+
+// readOnlyInstructions is the handshake text under read-only mode: which host
+// this is, what can be read (the FS roots), which tools exist, and how the
+// reading tools behave — there is no shell to fall back on, so a wrong guess
+// costs a failed call instead of a retry with grep.
+func readOnlyInstructions(cfg *Config) string {
+	host, _ := os.Hostname()
+	var enabled []string
+	for _, name := range sortedReadOnlyToolNames() {
+		if cfg.toolEnabled(name) {
+			enabled = append(enabled, name)
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "This server runs in READ-ONLY mode on host %s: every path is resolved on THAT host, not on the client machine. ", host)
+	if len(cfg.FSRoots) > 0 {
+		fmt.Fprintf(&b, "Only paths under these roots can be read: %s (anything else fails with \"path escapes allowed roots\"). ",
+			strings.Join(cfg.FSRoots, ", "))
+	}
+	fmt.Fprintf(&b, "Available tools: %s. ", strings.Join(enabled, ", "))
+	b.WriteString("Shell execution, sessions, and every write/edit/delete/move/copy/mkdir tool are disabled and " +
+		"cannot be re-enabled at runtime. Do not attempt to modify the host; if a change is required, report the " +
+		"exact command or diff for a human to apply. ")
+	b.WriteString("Reading: remote_read_file returns one window (64KB by default) and, when the file continues, " +
+		"truncated=true with next_offset / next_start_line; start_line/end_line reach any line of any file, " +
+		"lines=[...] picks single lines, line_numbers=true gives cat -n output. remote_read_files reads several " +
+		"files (or a glob) in one call. Patterns are RE2: alternation is a bare | (GNU grep's \\| matches a " +
+		"literal |). Globs: \"*.conf\" matches base names, \"conf/*.conf\" and \"**/*.conf\" match paths, " +
+		"\"*.{h,cpp}\" alternates. Encoding (utf-8 / gbk) is auto-detected. " +
+		"remote_read_file, remote_read_files, remote_search_content, remote_tail_log and remote_diff accept " +
+		"format=text: plain text (cat -n / grep -n style) under a one-line header with the same cursors, more " +
+		"compact than JSON. ")
+	fmt.Fprintf(&b, "Limits: one call blocks at most %ds (remote_tail_log follow_seconds is capped to it); "+
+		"rate limit %d requests/min per client host, burst %d (HTTP 429 carries retry_after_ms).",
+		cfg.callBudgetSec(), cfg.RateLimit, cfg.RateBurst)
 	return b.String()
 }
 

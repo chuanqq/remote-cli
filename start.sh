@@ -176,7 +176,7 @@ cmd_start() {
     fi
     if is_readonly; then
         echo -e "  运行模式:  ${CYAN}只读（READ-ONLY，最高优先级）${NC}"
-        echo "             仅保留 11 个只读工具；命令执行 / 写 / 编辑 / 删除 / 移动 / 复制 / 建目录 全部关闭"
+        echo "             仅保留 13 个只读工具；命令执行 / 写 / 编辑 / 删除 / 移动 / 复制 / 建目录 全部关闭"
         echo "             REST 仅放行 /api/ 下的 GET / HEAD"
     else
         echo -e "  运行模式:  ${YELLOW}读写（完整权限，等同交互式 shell）${NC}"
@@ -607,7 +607,7 @@ case "${1:-}" in
         echo "  SHELL_API_DISABLED_TOOLS 禁用的 MCP 工具，逗号分隔（默认: 不禁用）"
         echo ""
         echo "只读模式说明:"
-        echo "  开启后仅保留 11 个只读工具（文件读取 + 主机自省），命令执行、会话、"
+        echo "  开启后仅保留 13 个只读工具（文件读取 + 主机自省），命令执行、会话、"
         echo "  写/编辑/删除/移动/复制/建目录全部关闭，且无法在运行时恢复。"
         ;;
     *)

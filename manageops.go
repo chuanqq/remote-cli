@@ -32,7 +32,9 @@ func MoveFile(req MoveFileRequest, roots []string) (*MoveFileResult, error) {
 	if err := guardReadOnly("move_file"); err != nil {
 		return nil, err
 	}
-	srcAbs, err := validatePath(req.Src, roots)
+	// A rename moves the path itself: the source may be a symlink, which
+	// moves as a link; its parent directory must still be inside the roots.
+	srcAbs, err := validateLinkPath(req.Src, roots)
 	if err != nil {
 		return nil, err
 	}
@@ -57,18 +59,32 @@ func MoveFile(req MoveFileRequest, roots []string) (*MoveFileResult, error) {
 
 	if err := os.Rename(srcAbs, dstAbs); err != nil {
 		// Cross-filesystem move: copy then remove.
-		srcInfo, statErr := os.Stat(srcAbs)
+		srcInfo, statErr := os.Lstat(srcAbs)
 		if statErr != nil {
 			return nil, statErr
 		}
-		if srcInfo.IsDir() {
+		switch {
+		case srcInfo.Mode()&os.ModeSymlink != 0:
+			// Move the link itself: copying what it points to could pull
+			// content from outside the FS roots into them.
+			target, err := os.Readlink(srcAbs)
+			if err != nil {
+				return nil, err
+			}
+			if err := os.Symlink(target, dstAbs); err != nil {
+				return nil, fmt.Errorf("cross-device move (link): %w", err)
+			}
+			if err := os.Remove(srcAbs); err != nil {
+				return nil, fmt.Errorf("cross-device move (cleanup): %w", err)
+			}
+		case srcInfo.IsDir():
 			if _, err := copyDirRecursive(srcAbs, dstAbs); err != nil {
 				return nil, fmt.Errorf("cross-device move (copy): %w", err)
 			}
 			if err := os.RemoveAll(srcAbs); err != nil {
 				return nil, fmt.Errorf("cross-device move (cleanup): %w", err)
 			}
-		} else {
+		default:
 			if _, err := copyOneFile(srcAbs, dstAbs); err != nil {
 				return nil, fmt.Errorf("cross-device move (copy): %w", err)
 			}
@@ -247,7 +263,8 @@ func DeleteFile(req DeleteFileRequest, roots []string) (*DeleteFileResult, error
 	if err := guardReadOnly("delete_file"); err != nil {
 		return nil, err
 	}
-	abs, err := validatePath(req.Path, roots)
+	// Deleting a symlink removes the link, never its target.
+	abs, err := validateLinkPath(req.Path, roots)
 	if err != nil {
 		return nil, err
 	}

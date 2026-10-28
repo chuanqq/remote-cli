@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // ---------------------------------------------------------------------------
@@ -42,11 +44,13 @@ import (
 var readOnlyTools = map[string]bool{
 	// File reads
 	"remote_read_file":       true,
+	"remote_read_files":      true,
 	"remote_list_dir":        true,
 	"remote_stat":            true,
 	"remote_search_content":  true,
 	"remote_find_files":      true,
 	"remote_tail_log":        true,
+	"remote_diff":            true,
 	"remote_download_base64": true,
 	// Host introspection
 	"remote_list_processes": true,
@@ -128,6 +132,7 @@ var allToolNames = []string{
 	"remote_check_port",
 	"remote_get_env_info",
 	"remote_read_file",
+	"remote_read_files",
 	"remote_write_file",
 	"remote_edit_file",
 	"remote_list_dir",
@@ -137,6 +142,7 @@ var allToolNames = []string{
 	"remote_search_content",
 	"remote_find_files",
 	"remote_tail_log",
+	"remote_diff",
 	"remote_move_file",
 	"remote_copy_file",
 	"remote_delete_file",
@@ -174,6 +180,20 @@ func sortedReadOnlyToolNames() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// readOnlyHints marks a tool as a pure read in its MCP annotations. mcp-go
+// defaults every tool to readOnlyHint=false and destructiveHint=true, and
+// clients act on that: Claude Code derives a tool's isReadOnly and
+// isConcurrencySafe from readOnlyHint, so an unmarked read tool is treated as
+// destructive and never runs in parallel with other calls.
+func readOnlyHints() mcp.ToolOption {
+	return func(t *mcp.Tool) {
+		t.Annotations.ReadOnlyHint = mcp.ToBoolPtr(true)
+		t.Annotations.DestructiveHint = mcp.ToBoolPtr(false)
+		t.Annotations.IdempotentHint = mcp.ToBoolPtr(true)
+		t.Annotations.OpenWorldHint = mcp.ToBoolPtr(false)
+	}
 }
 
 // readOnlyRESTDenied is the layer-2 handler substituted for every mutating REST

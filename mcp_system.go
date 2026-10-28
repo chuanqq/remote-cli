@@ -20,6 +20,7 @@ func registerSystemTools(s *server.MCPServer, cfg *Config) {
 
 	if cfg.toolEnabled("remote_list_processes") {
 		s.AddTool(mcp.NewTool("remote_list_processes",
+			readOnlyHints(),
 			mcp.WithDescription("List running processes on the remote server (pid/ppid/user/state/elapsed/cmd/cmdline), replacing `ps -ef | grep ...`. Optional regex filter and user filter."),
 			mcp.WithString("filter", mcp.Description("RE2 regex matched against the full command line, e.g. \"toadpolicy|bpget\".")),
 			mcp.WithString("user", mcp.Description("Only processes owned by this user.")),
@@ -39,6 +40,7 @@ func registerSystemTools(s *server.MCPServer, cfg *Config) {
 
 	if cfg.toolEnabled("remote_check_port") {
 		s.AddTool(mcp.NewTool("remote_check_port",
+			readOnlyHints(),
 			mcp.WithDescription("Check which ports are listening on the remote server and which process owns them, replacing `ss -lntp | grep <port>` / netstat / lsof. Returns an empty list when nothing matches."),
 			mcp.WithNumber("port", mcp.Description("Port number to check. Omit or 0 to list all listening ports.")),
 			mcp.WithString("process_name", mcp.Description("Case-insensitive substring filter on the owning process name.")),
@@ -59,6 +61,7 @@ func registerSystemTools(s *server.MCPServer, cfg *Config) {
 
 	if cfg.toolEnabled("remote_get_env_info") {
 		s.AddTool(mcp.NewTool("remote_get_env_info",
+			readOnlyHints(),
 			mcp.WithDescription("One-call environment profile of the remote server: OS/kernel/arch, hostname, user, shells, locale, memory/load, availability+version of common toolchains (python3, rg, rsync, mysql, ...), and the server config (FSRoots, disabled tools, limits). Call once at the start of a session instead of probing with which/--version/uname commands."),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			auditCall(ctx, "get_env_info")
