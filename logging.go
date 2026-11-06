@@ -112,7 +112,7 @@ func newRequestID() string {
 }
 
 // statusRecorder captures the response status and size for the access log. It
-// must keep http.Flusher working: /mcp GET and /api/execute/stream are SSE.
+// must keep http.Flusher working because the MCP GET stream is SSE.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int

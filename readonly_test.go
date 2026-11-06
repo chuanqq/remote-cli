@@ -107,7 +107,7 @@ func TestLoadConfigReadOnlyFromEnv(t *testing.T) {
 	}
 }
 
-// Layer 4: every mutating file operation fails closed, even when called
+// Layer 2: every mutating file operation fails closed, even when called
 // directly with a valid sandboxed path.
 func TestReadOnlyBlocksFileMutations(t *testing.T) {
 	root := t.TempDir()
@@ -199,7 +199,7 @@ func TestReadOnlyAllowsReads(t *testing.T) {
 	}
 }
 
-// Layer 4 for shell execution: the executor refuses to spawn anything.
+// Layer 2 for shell execution: the executor refuses to spawn anything.
 func TestReadOnlyBlocksExecutor(t *testing.T) {
 	root := t.TempDir()
 	marker := filepath.Join(root, "written-by-shell")
@@ -217,23 +217,6 @@ func TestReadOnlyBlocksExecutor(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Error("shell command ran under read-only mode")
 	}
-
-	var sawError bool
-	var exitCode int
-	exec.ExecuteStream(context.Background(), ExecuteRequest{Command: "touch " + marker + "-stream"}, func(e StreamEvent) {
-		if e.Type == "error" {
-			sawError = true
-		}
-		if e.Type == "exit" {
-			exitCode = e.ExitCode
-		}
-	})
-	if !sawError || exitCode == 0 {
-		t.Error("ExecuteStream did not refuse under read-only mode")
-	}
-	if _, err := os.Stat(marker + "-stream"); !os.IsNotExist(err) {
-		t.Error("streamed shell command ran under read-only mode")
-	}
 }
 
 // Linting spawns an interpreter, so it must be skipped under read-only mode.
@@ -242,53 +225,6 @@ func TestReadOnlySkipsLint(t *testing.T) {
 	res := LintFile("/tmp/whatever.sh", "bash")
 	if !res.Skipped {
 		t.Error("LintFile did not skip under read-only mode")
-	}
-}
-
-// Layer 3: the method filter rejects any non-GET/HEAD request under /api/.
-func TestReadOnlyMiddleware(t *testing.T) {
-	reached := false
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reached = true
-		w.WriteHeader(http.StatusOK)
-	})
-	h := ReadOnlyMiddleware(true, next)
-
-	cases := []struct {
-		method, path string
-		wantStatus   int
-		wantReached  bool
-	}{
-		{http.MethodPost, "/api/execute", http.StatusForbidden, false},
-		{http.MethodPost, "/api/sessions", http.StatusForbidden, false},
-		{http.MethodDelete, "/api/executions/abc", http.StatusForbidden, false},
-		{http.MethodPut, "/api/anything-new", http.StatusForbidden, false},
-		{http.MethodGet, "/api/status", http.StatusOK, true},
-		// MCP rides on POST by protocol and is gated by tool registration.
-		{http.MethodPost, "/mcp", http.StatusOK, true},
-	}
-
-	for _, c := range cases {
-		reached = false
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(c.method, c.path, nil))
-		if rec.Code != c.wantStatus {
-			t.Errorf("%s %s: status %d, want %d", c.method, c.path, rec.Code, c.wantStatus)
-		}
-		if reached != c.wantReached {
-			t.Errorf("%s %s: handler reached = %v, want %v", c.method, c.path, reached, c.wantReached)
-		}
-		if rec.Header().Get("X-Read-Only") != "true" {
-			t.Errorf("%s %s: missing X-Read-Only header", c.method, c.path)
-		}
-	}
-
-	// Disabled mode must be a pass-through with no added header.
-	reached = false
-	rec := httptest.NewRecorder()
-	ReadOnlyMiddleware(false, next).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/execute", nil))
-	if !reached || rec.Code != http.StatusOK {
-		t.Error("ReadOnlyMiddleware(false) did not pass the request through")
 	}
 }
 
@@ -344,7 +280,7 @@ func TestToolInventoryMatchesRegistrations(t *testing.T) {
 	}
 }
 
-// Layer-4 completeness check. Every function containing a filesystem-mutating
+// Layer-2 completeness check. Every function containing a filesystem-mutating
 // syscall must either call guardReadOnly itself or be an unexported helper only
 // reachable from a guarded caller. This is what stops a future write path from
 // landing without a guard.

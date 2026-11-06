@@ -581,7 +581,7 @@ func TestLoggingMiddlewareStatusAndStreamLevel(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusTeapot)
 	}))
-	req := httptest.NewRequest(http.MethodPost, "/api/execute", nil)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
 	req.RemoteAddr = "10.1.2.3:5555"
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

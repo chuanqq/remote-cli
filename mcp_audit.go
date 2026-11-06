@@ -39,7 +39,7 @@ func mcpHTTPContext(ctx context.Context, r *http.Request) context.Context {
 }
 
 // sourceIPFrom returns the peer host injected by mcpHTTPContext (or by the
-// access-log middleware for REST calls).
+// access-log middleware).
 func sourceIPFrom(ctx context.Context) string {
 	if ip, ok := ctx.Value(sourceIPKey{}).(string); ok && ip != "" {
 		return ip

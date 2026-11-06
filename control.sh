@@ -6,7 +6,7 @@
 #
 # 部署目录只需: control.sh + remote-agent-proxy(二进制) + env.conf(可选，覆盖下方默认值)。
 # build 子命令需在源码目录执行，会通过 -ldflags 注入版本 / commit / 构建时间，
-# 运行态可用 `./control.sh version`、/api/status、remote_status 查看。
+# 运行态可用 `./control.sh version`、MCP 客户端或 remote_status 查看。
 
 set -euo pipefail
 
@@ -42,13 +42,9 @@ if [[ -f "${SCRIPT_DIR}/env.conf" ]]; then
     set +a
 fi
 
-# TOKEN 的 sk-123456 默认值在 env.conf 之后注入：若 env.conf 改用
-# TOKEN_HASH（哈希模式，服务端不落明文），则不补默认值，避免两者同时
-# 被设置而触发服务端的互斥报错。空串兜底保证 set -u 下后续引用安全。
+# 空串兜底保证 set -u 下后续引用安全；未配置时由 cmd_start/cmd_foreground
+# 生成新的随机 Token。
 : "${SHELL_API_TOKEN:=}"
-if [[ -z "${SHELL_API_TOKEN}" && -z "${SHELL_API_TOKEN_HASH}" ]]; then
-    SHELL_API_TOKEN="sk-123456"
-fi
 
 # ──────────────────────────────────────────────
 # 辅助函数
@@ -211,19 +207,9 @@ cmd_start() {
         log_info "服务启动成功 (PID: ${pid})"
         echo ""
         echo -e "${CYAN}快速验证:${NC}"
-        echo "  curl http://localhost:${SHELL_API_PORT}/api/status"
+        echo "  MCP 端点: http://localhost:${SHELL_API_PORT}/mcp"
         echo ""
-        echo -e "${CYAN}执行命令:${NC}"
-        # 哈希模式下脚本不知道明文 Token，示例命令用占位符提示用户替换
-        local bearer="\$SHELL_API_TOKEN"
-        [[ -n "${SHELL_API_TOKEN}" ]] || bearer="<你的明文 Token>"
-        echo "  curl -X POST http://localhost:${SHELL_API_PORT}/api/execute \\"
-        echo "    -H \"Authorization: Bearer ${bearer}\" \\"
-        echo "    -H \"Content-Type: application/json\" \\"
-        echo "    -d '{\"command\":\"uname -a\"}'"
-        echo ""
-        echo -e "${CYAN}MCP 端点:${NC}"
-        echo "  http://localhost:${SHELL_API_PORT}/mcp"
+        echo "  使用 MCP 客户端连接并调用工具"
     else
         log_error "服务启动失败，请查看日志: ${LOG_FILE}"
         rm -f "${PID_FILE}"
@@ -302,7 +288,7 @@ cmd_status() {
 
     # 实际监听端口。lsof 的 -p 与 -i 默认取并集，必须加 -a 取交集，否则会
     # 列出机器上所有监听进程（-P -n 禁用服务名/主机名解析）。探测不到时
-    # 回退到配置值，健康检查也用它。
+    # 回退到配置值，MCP 端点检查也用它。
     local port=""
     if command -v lsof &>/dev/null; then
         port=$(lsof -a -P -n -p "${pid}" -i TCP -s TCP:LISTEN -Fn 2>/dev/null \
@@ -311,19 +297,14 @@ cmd_status() {
     [[ -n "${port}" ]] || port="${SHELL_API_PORT:-unknown}"
     echo "  端口:      ${port}"
 
-    # 尝试健康检查（同时输出运行中进程报告的版本）
+    # MCP 端点探测（未携带凭据时应返回 401，说明服务已接受连接）
     if command -v curl &>/dev/null; then
-        local body code
-        body=$(curl -s -w '\n%{http_code}' "http://localhost:${port}/api/status" 2>/dev/null || true)
-        code="${body##*$'\n'}"
-        if [[ "${code}" == "200" ]]; then
-            echo "  健康检查:  正常 (HTTP ${code})"
-            local ver commit
-            ver=$(echo "${body}" | grep -oE '"version":"[^"]*"' | cut -d'"' -f4 || true)
-            commit=$(echo "${body}" | grep -oE '"commit":"[^"]*"' | cut -d'"' -f4 || true)
-            echo "  运行版本:  ${ver:-unknown} (commit ${commit:-unknown})"
+        local resp
+        resp=$(curl -s --max-time 3 -o /dev/null -w "%{http_code}" "http://localhost:${port}/mcp" 2>/dev/null || true)
+        if [[ "${resp}" == "401" ]]; then
+            echo "  MCP 检查:   正常（HTTP ${resp}，端点要求鉴权）"
         else
-            echo "  健康检查:  异常 (HTTP ${code:-无响应})"
+            echo "  MCP 检查:   异常（HTTP ${resp:-无响应}）"
         fi
     fi
 
@@ -413,7 +394,7 @@ case "${1:-}" in
         echo "  start       后台启动服务"
         echo "  stop        优雅停止服务（SIGTERM，超时后 kill -9）"
         echo "  restart     重启服务"
-        echo "  status      查看服务运行状态与运行版本"
+        echo "  status      查看进程状态与 MCP 端点可达性"
         echo "  foreground  前台运行（Ctrl+C 停止）"
         echo "  build       编译二进制文件（注入版本/commit/构建时间，需在源码目录）"
         echo "  version     显示二进制版本"

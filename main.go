@@ -39,64 +39,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	if (cfg.TLSCert == "") != (cfg.TLSKey == "") {
+		logger.Error("invalid TLS configuration: SHELL_API_TLS_CERT and SHELL_API_TLS_KEY must be set together")
+		os.Exit(1)
+	}
+
 	executor := NewExecutor(cfg)
 	sessions := NewSessionManager()
 	jobs := NewJobManager(cfg)
 	waits := NewWaitManager()
 	audit := NewAuditLogger(logger)
 
-	executeHandler := NewExecuteHandler(executor, audit)
-	streamHandler := NewStreamHandler(executor, audit)
-	sessionHandler := NewSessionHandler(sessions, executor, audit)
-	statusHandler := NewStatusHandler(sessions)
-
-	mux := http.NewServeMux()
-
-	// Layer 2: mutating REST endpoints are replaced by a 403 responder under
-	// read-only mode. They stay routed so clients get an explanatory error
-	// instead of a 404 that looks like a deployment problem.
-	if cfg.ReadOnly {
-		for _, p := range mutatingRESTPaths {
-			mux.HandleFunc(p, readOnlyRESTDenied)
-		}
-	} else {
-		mux.HandleFunc("/api/execute", executeHandler.Handle)
-		mux.HandleFunc("/api/execute/stream", streamHandler.Handle)
-		mux.HandleFunc("/api/sessions", sessionHandler.HandleCreate)
-		mux.HandleFunc("/api/sessions/", func(w http.ResponseWriter, r *http.Request) {
-			path := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-			if strings.HasSuffix(path, "/execute") {
-				sessionHandler.HandleExecute(w, r)
-			} else if r.Method == http.MethodDelete {
-				sessionHandler.HandleDelete(w, r)
-			} else {
-				writeError(w, http.StatusNotFound, "not_found", "Not found")
-			}
-		})
-		mux.HandleFunc("/api/executions/", executeHandler.HandleCancel)
-	}
-
-	mux.HandleFunc("/api/status", statusHandler.Handle)
-	mux.Handle("/mcp", NewMCPHandler(executor, sessions, jobs, waits, audit, cfg))
-
-	rateLimiter := NewRateLimiter(cfg.RateLimit, cfg.RateBurst)
-
 	// endStreams ends long-lived MCP GET streams when shutdown begins, so
 	// they do not hold Shutdown open for the whole grace period.
 	streamsCtx, endStreams := context.WithCancel(context.Background())
 
-	// Wrapping order (outermost last) gives the request flow:
-	//   Logging -> RateLimit -> Auth -> ReadOnly -> Drain -> mux
-	// Auth precedes the read-only filter so an unauthenticated caller still
-	// gets 401 and learns nothing about the server's mode. /api/status skips
-	// auth internally, so it still reaches ReadOnlyMiddleware and carries the
-	// X-Read-Only header. Logging is outermost so 401/429 are logged too.
-	var handler http.Handler = mux
-	handler = drainStreamsMiddleware(streamsCtx, handler)
-	handler = ReadOnlyMiddleware(cfg.ReadOnly, handler)
-	handler = AuthMiddleware(auth, handler)
-	handler = RateLimitMiddleware(rateLimiter, handler)
-	handler = LoggingMiddleware(logger, handler)
+	handler := newHTTPHandler(NewMCPHandler(executor, sessions, jobs, waits, audit, cfg), auth, cfg, logger, streamsCtx)
 
 	// baseCtx is the parent of every request context. It is cancelled only
 	// when the shutdown grace period runs out, which kills whatever is still
@@ -144,6 +102,19 @@ func main() {
 	stopSignals() // a second signal now terminates immediately
 
 	gracefulShutdown(logger, srv, executor, jobs, waits, endStreams, cancelBase, cfg.ShutdownGrace)
+}
+
+// newHTTPHandler 只注册 MCP 入口，所有请求统一经过鉴权与访问日志。
+func newHTTPHandler(mcpHandler http.Handler, auth *tokenAuth, cfg *Config, logger *slog.Logger, streamsCtx context.Context) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", mcpHandler)
+
+	// 请求顺序：Logging -> RateLimit -> Auth -> Drain -> mux。
+	var handler http.Handler = mux
+	handler = drainStreamsMiddleware(streamsCtx, handler)
+	handler = AuthMiddleware(auth, handler)
+	handler = RateLimitMiddleware(NewRateLimiter(cfg.RateLimit, cfg.RateBurst), handler)
+	return LoggingMiddleware(logger, handler)
 }
 
 // gracefulShutdown stops accepting connections, lets in-flight executions
@@ -212,7 +183,7 @@ func logStartup(logger *slog.Logger, cfg *Config, authMode string) {
 		"commit", gitCommit,
 		"build_time", buildTime,
 		"addr", ":" + cfg.Port,
-		"tls", cfg.TLSCert != "",
+		"tls", cfg.TLSCert != "" && cfg.TLSKey != "",
 		"auth_mode", authMode,
 		"max_timeout_sec", cfg.MaxTimeout,
 		"max_output", cfg.MaxOutput,
@@ -241,7 +212,7 @@ func logStartup(logger *slog.Logger, cfg *Config, authMode string) {
 				enabled = append(enabled, name)
 			}
 		}
-		logger.Info("READ-ONLY MODE: ENABLED (highest priority); REST: only GET/HEAD under /api/ are served",
+		logger.Info("READ-ONLY MODE: ENABLED (highest priority); mutating MCP tools are disabled",
 			"enabled_tools", strings.Join(enabled, ","),
 			"disabled_tools", strings.Join(readOnlyDisabledTools(), ","))
 	}

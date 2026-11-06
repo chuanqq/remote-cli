@@ -13,15 +13,15 @@ import (
 type Config struct {
 	Port  string
 	Token string
-	// TokenHash, when set instead of Token, is "sha256$<salt-hex>$<hash-hex>"
+	// TokenHash, when set instead of Token, is "sha256:<salt-hex>:<hash-hex>"
 	// (hash = SHA-256(salt || token)): the server stores no plaintext
 	// credential. Mutually exclusive with Token; enforced at startup.
-	TokenHash   string
-	TLSCert     string
-	TLSKey      string
-	MaxTimeout  int
-	MaxOutput   int
-	RateLimit   int
+	TokenHash  string
+	TLSCert    string
+	TLSKey     string
+	MaxTimeout int
+	MaxOutput  int
+	RateLimit  int
 	// RateBurst is the token-bucket capacity per client host: how many
 	// requests may arrive back to back before the RateLimit/min refill rate
 	// takes over.
@@ -57,8 +57,8 @@ type Config struct {
 	// (e.g. "remote_execute"). A disabled tool is invisible to MCP clients.
 	DisabledTools map[string]bool
 	// ReadOnly, when true, forces the server into read-only mode: every
-	// mutating tool and REST endpoint is disabled regardless of any other
-	// setting. This flag has the HIGHEST priority — nothing overrides it.
+	// mutating tool is disabled regardless of any other setting. This flag has
+	// the HIGHEST priority — nothing overrides it.
 	ReadOnly bool
 }
 

@@ -43,7 +43,7 @@ type ServerProfile struct {
 	Commit    string `json:"commit"`
 	BuildTime string `json:"build_time"`
 	// ReadOnly reports read-only mode. When true every mutating tool is
-	// unregistered and mutating REST endpoints answer 403.
+	// unregistered.
 	ReadOnly      bool     `json:"read_only"`
 	FSRoots       []string `json:"fs_roots,omitempty"`
 	DisabledTools []string `json:"disabled_tools,omitempty"`

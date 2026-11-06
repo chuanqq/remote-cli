@@ -4,24 +4,24 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/chuanqq/remote-cli)](https://goreportcard.com/report/github.com/chuanqq/remote-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-**English:** A single-binary MCP (Model Context Protocol) server written in Go that lets AI agents (such as Claude Code) securely operate remote hosts. It exposes 24 dedicated tools over Streamable HTTP — shell execution with persistent sessions, file read/write/edit, server-side content search, log tailing with cursors and follow, process/port inspection and an environment profile — so the agent rarely needs to fall back to raw shell commands.
+**English:** A single-binary MCP (Model Context Protocol) server written in Go that lets AI agents (such as Claude Code) securely operate remote hosts. It exposes 33 dedicated tools through one Streamable HTTP MCP endpoint — shell execution with persistent sessions, file read/write/edit, server-side content search, log tailing with cursors and follow, process/port inspection and an environment profile — so the agent rarely needs to fall back to raw shell commands.
 
 一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 33 个专用工具:命令执行与持久会话、超出调用时长可续取的执行与服务端等待、后台任务、文件读写编辑与批量读取、服务端内容搜索与文件/目录对比、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
 
 编译产物为单二进制,零外部运行时依赖;TLS 与 Bearer Token 鉴权开箱即用。
 
-> **说明**:早期版本附带的 REST API 仍保留在代码中以兼容旧客户端,但不再是推荐接入方式,本文档不再展开;新接入请一律使用 MCP。
+> **说明**:自 v1.6.0 起服务只保留 MCP Streamable HTTP 入口,早期版本的 REST 兼容接口已移除;客户端请统一使用 MCP。
 
 ## 特性
 
-- **命令执行**:同步执行、可取消(含客户端断开),基于进程组的硬超时控制,有界输出捕获可选保留头部或尾部(`truncate_mode`),可选 GBK 等输出解码(`output_encoding`)
+- **命令执行**:可取消、可续取结果的执行,基于进程组的硬超时控制,有界输出捕获可选保留头部或尾部(`truncate_mode`),可选 GBK 等输出解码(`output_encoding`)
 - **后台任务与等待**:`remote_spawn` 启动脱离调用的后台任务并按 job id 查询/读日志/终止;`remote_wait_for` 服务端等待文件/日志/进程/端口/命令条件,满足即返回
 - **持久会话**:维护 cwd / shell / 环境变量,`cd` 后自动同步工作目录,带 TTL 自动回收;会话的创建/列出/销毁均有对应 MCP 工具
 - **文件操作**:读 / 写 / 编辑 / 列目录 / stat / 移动 / 复制 / 删除 / 建目录,支持 UTF-8 / GBK / GB2312 / GB18030 编码互转与自动探测,大文件支持 base64 分块上传下载;写入类操作返回 sha256/mode 自检,可选 bash/python 语法 lint
 - **内容搜索与日志**:服务端实现的内容正则搜索、文件名查找、大日志尾部/增量/跟随读取,不依赖目标机 grep/rg/find
 - **主机洞察**:进程枚举、监听端口检查、一次性环境画像(36 个常用工具链探测)
 - **运维**:SIGTERM 优雅退出、构建时注入版本与 commit、MCP 长连接心跳
-- **只读模式**:`SHELL_API_READONLY=true` 一键将服务降级为纯读取代理,四层强制、运行时不可恢复,优先级高于其他所有配置
+- **只读模式**:`SHELL_API_READONLY=true` 一键将服务降级为纯读取代理,工具注册与操作兜底两层强制、运行时不可恢复,优先级高于其他所有配置
 - **安全控制**:Bearer Token 鉴权(常量时间比较)、按客户端 IP 的令牌桶限流、可选跳板命令拦截、输出字节上限、超时上限、可选多目录 `FSRoot` 文件系统沙箱、工具黑名单、删除工具双重确认
 - **可观测**:JSON 结构化访问日志(含状态码)与审计日志,通过 `req_id` 关联,记录每次调用的真实来源 IP、工具名、耗时与失败原因,并对 mysql 密码、Bearer token 等敏感信息自动脱敏
 
@@ -85,7 +85,19 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 }
 ```
 
-连通后客户端 `tools/list` 应能看到全部 33 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 32 个)。服务另有免鉴权的 `GET /api/status` 健康探针,可用于负载均衡或监控探活。
+连通后客户端 `tools/list` 应能看到全部 33 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 32 个)。服务端只提供上述 MCP 端点,不存在独立的 REST HTTP 接口。
+
+## v1.6.0 升级说明
+
+本版本删除全部旧 REST 接口,包括 `/api/status`、`/api/execute`、`/api/execute/stream`、`/api/sessions*` 和 `/api/executions/*`。携带有效凭据访问这些路径时返回 404;未鉴权请求统一返回 401。唯一 HTTP 入口为 `/mcp`,所有 MCP 请求均要求 Bearer Token。
+
+- 命令执行、会话管理和取消操作迁移到对应的 `remote_*` MCP 工具。
+- 运行中的健康状态、版本和只读标志通过 MCP 的 `remote_status` 查询;握手 `initialize` 也会返回服务版本。
+- `start.sh status` 与 `control.sh status` 检查进程和 `/mcp` 的 401 鉴权响应,只表示端点可达;不再读取匿名状态数据。二进制版本使用 `--version`,实际运行版本通过 MCP 查询。
+- `readonly-check` 改为校验 MCP 握手的只读声明和工具清单;哈希模式仍需传入 `CHECK_TOKEN` 明文凭据。
+- `upgrade.sh` 通过已鉴权的 MCP 握手确认金丝雀、新服务和回滚版本。明文模式从各部署目录的 `env.conf` 读取 Token;哈希模式须传 `CHECK_TOKEN`,旧服务凭据不同时另传 `OLD_CHECK_TOKEN`。缺少探测凭据会在停止旧服务前拒绝升级。
+- `control.sh` 未配置凭据时会生成随机 Token,固定默认 Token 已删除;已部署实例仍须轮换旧凭据。
+- TLS 只配置证书或私钥时拒绝启动,避免配置不完整时回退到明文 HTTP。
 
 ## 配置项
 
@@ -97,11 +109,11 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_PORT` | `8080` | 监听端口 |
 | `SHELL_API_TOKEN` | (必填) | Bearer Token,客户端鉴权凭据 |
 | `SHELL_API_TOKEN_HASH` | (二选一) | Token 的盐化 SHA-256,格式 `sha256:<salt-hex>:<hash-hex>`(hash = SHA-256(salt ‖ token)),与 `SHELL_API_TOKEN` 互斥且必须恰好设置其一。服务端不落明文,客户端仍发送明文 Bearer。生成: `printf '%s' 'your-token' \| ./remote-agent-proxy hash-token` |
-| `SHELL_API_TLS_CERT` | (空) | TLS 证书路径,留空则监听明文 HTTP |
-| `SHELL_API_TLS_KEY` | (空) | TLS 私钥路径 |
+| `SHELL_API_TLS_CERT` | (空) | TLS 证书路径;与 `SHELL_API_TLS_KEY` 同时留空时使用 HTTP,仅设置其中一项则拒绝启动 |
+| `SHELL_API_TLS_KEY` | (空) | TLS 私钥路径;与 `SHELL_API_TLS_CERT` 必须同时设置 |
 | `SHELL_API_MAX_TIMEOUT` | `300` | 单次命令超时上限(秒) |
 | `SHELL_API_MAX_OUTPUT` | `1048576` | stdout / stderr 字节上限(`max_output_bytes` 不能超过它) |
-| `SHELL_API_RATE_LIMIT` | `120` | 限流令牌桶补充速率(每客户端 IP 每分钟),按 IP 计数(不含端口);`GET /mcp` 长连接与 `/api/status` 不计数 |
+| `SHELL_API_RATE_LIMIT` | `120` | 限流令牌桶补充速率(每客户端 IP 每分钟),按 IP 计数(不含端口);`GET /mcp` 长连接不计数 |
 | `SHELL_API_RATE_BURST` | `60` | 限流令牌桶容量(每客户端 IP 可连续突发的请求数) |
 | `SHELL_API_DEFAULT_SHELL` | `bash` | 默认 shell |
 | `SHELL_API_FS_ROOT` | (空) | 文件操作沙箱根目录,支持逗号分隔多个目录前缀,留空则不限制(等同 shell 信任级别) |
@@ -557,16 +569,14 @@ SHELL_API_TOKEN=xxx SHELL_API_READONLY=true ./remote-agent-proxy
 ./start.sh readonly-check    # 校验只读是否真正生效
 ```
 
-四层独立强制,任何单层失效都不会打开写通路:
+两层独立强制,任何单层失效都不会打开写通路:
 
 | 层 | 位置 | 作用 |
 | --- | --- | --- |
 | 1. 工具注册 | `config.go` `toolEnabled` + 各 `register*` | 20 个写工具**不注册**,`tools/list` 里根本不存在 |
-| 2. REST 路由 | `main.go` | `/api/execute`、`/api/execute/stream`、`/api/sessions*`、`/api/executions/*` 返回 403 `read_only_mode` |
-| 3. HTTP 中间件 | `middleware.go` `ReadOnlyMiddleware` | `/api/` 下只放行 GET / HEAD,新增端点默认被拦 |
-| 4. 操作兜底 | `readonly.go` `guardReadOnly` | `WriteFileContent` / `EditFileContent` / `UploadBase64` / `MoveFile` / `CopyFile` / `DeleteFile` / `MakeDir` / `Executor.Execute` / `ExecuteStream` / `LintFile` 内部直接失败 |
+| 2. 操作兜底 | `readonly.go` `guardReadOnly` | `WriteFileContent` / `EditFileContent` / `UploadBase64` / `MoveFile` / `CopyFile` / `DeleteFile` / `MakeDir` / `Executor.Execute` / `LintFile` 内部直接失败 |
 
-第 1 层用的是**白名单**(`readonly.go` 的 `readOnlyTools`):将来新增的工具在未被显式审计并加入白名单前一律禁用,漏改代码的后果是"少一个读工具",而不是"多一个写通路"。第 4 层保证即使注册层被绕过(例如后续误加了一个未走 `toolEnabled` 的注册点),底层操作仍然拒绝执行。
+第 1 层用的是**白名单**(`readonly.go` 的 `readOnlyTools`):将来新增的工具在未被显式审计并加入白名单前一律禁用,漏改代码的后果是"少一个读工具",而不是"多一个写通路"。第 2 层保证即使注册层被绕过(例如后续误加了一个未走 `toolEnabled` 的注册点),底层操作仍然拒绝执行。
 
 只读模式下允许的 13 个工具:
 
@@ -582,10 +592,10 @@ remote_get_env_info  remote_status
 ```bash
 SHELL_API_READONLY=true \
 SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
-./remote-agent-proxy      # 最终只剩 9 个工具
+./remote-agent-proxy      # 最终只剩 11 个工具
 ```
 
-模式对客户端是自描述的:MCP handshake 里 server name 变为 `remote-shell-readonly`,instructions 写明主机名、FSRoot、可用工具清单和读取约定(分页游标、RE2 交替写法、glob 规则);每个只读工具都带 `readOnlyHint: true` / `destructiveHint: false` 注解(mcp-go 默认是相反值,Claude Code 据此判断工具能否并发执行),`/api/status` 与 `remote_get_env_info` 返回 `read_only: true`,响应头带 `X-Read-Only: true`。
+模式对客户端是自描述的:MCP handshake 里 server name 变为 `remote-shell-readonly`,instructions 写明主机名、FSRoot、可用工具清单和读取约定(分页游标、RE2 交替写法、glob 规则);每个只读工具都带 `readOnlyHint: true` / `destructiveHint: false` 注解(mcp-go 默认是相反值,Claude Code 据此判断工具能否并发执行),`remote_status` 与 `remote_get_env_info` 返回 `read_only: true`。
 
 **建议同时设置 `SHELL_API_FS_ROOT`**:只读模式管住"能不能改",FSRoot 管住"能读到哪";两者正交。若要更强的保证,可再用一个对目标目录只有读权限的系统账户运行本服务。
 
@@ -616,14 +626,14 @@ SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-
 
 可禁用的工具名即上文列出的 33 个。
 
-如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,拦不住 `/api/execute` 等 REST 端点,漏写一个工具名就留一个写通路。
+如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,漏写一个工具名就可能留下一条写通路。
 
 ### 审计日志
 
 服务的所有日志都是一行一个 JSON 对象(`log/slog`),输出到 stderr。两类记录通过 `req_id` 关联,同一请求的 `req_id` 也在响应头 `X-Request-Id` 中返回:
 
 - **访问日志** `type=access`:`req_id / remote / method / path / status / bytes / dur_ms`,MCP 请求另带 `mcp_method`(`initialize` / `tools/list` / `tools/call` …)、`tool` 与 `mcp_session`。401 / 429 也会记录。`GET /mcp` 长连接只在 `SHELL_API_LOG_LEVEL=debug` 下记录
-- **审计日志** `type=audit`:每次工具调用一行,由统一的 MCP 工具中间件写入,字段 `req_id / exec_id / remote / mcp_session / client / tool / session_id / command / working_directory / exit_code / dur_ms / output_bytes / truncated / timed_out / state / error`。`client` 是 MCP 握手 `clientInfo` 的 `name/version`(区分 agent 与人工 REST 调用);超出调用预算的命令先记一行 `state=running`,结束时再以同一 `exec_id` 记一行最终状态。`tool` 一律为注册工具名,`remote` 为真实对端 IP(不含端口),失败时 `error` 给出原因;REST 接口的 `tool` 为 `rest_execute` / `rest_session_execute` / `rest_execute_stream`
+- **审计日志** `type=audit`:每次工具调用一行,由统一的 MCP 工具中间件写入,字段 `req_id / exec_id / remote / mcp_session / client / tool / session_id / command / working_directory / exit_code / dur_ms / output_bytes / truncated / timed_out / state / error`。`client` 是 MCP 握手 `clientInfo` 的 `name/version`;超出调用预算的命令先记一行 `state=running`,结束时再以同一 `exec_id` 记一行最终状态。`tool` 一律为注册工具名,`remote` 为真实对端 IP(不含端口),失败时 `error` 给出原因
 
 ```json
 {"time":"...","level":"INFO","msg":"audit","type":"audit","req_id":"r-4497e438","remote":"172.26.97.60","tool":"remote_execute","command":"echo hi","exit_code":0,"dur_ms":5,"output_bytes":3,"timed_out":false,"exec_id":"04034b32-...","mcp_session":"mcp-session-..."}
@@ -661,7 +671,7 @@ GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy
 
 ### 构建脚本
 
-`build.sh` 封装了多平台交叉编译,产物统一输出到 `dist/`(命名 `remote-agent-proxy-<版本>-<os>-<arch>`,版本号自动从 `types.go` 提取)。构建时通过 `-ldflags -X` 注入 `serverVersion` / `gitCommit`(工作区有未提交改动时带 `-dirty`)/ `buildTime`,运行态可用 `./remote-agent-proxy --version`、`/api/status`、`remote_status`、`remote_get_env_info` 或 MCP 握手的 `serverInfo.version` 查看:
+`build.sh` 封装了多平台交叉编译,产物统一输出到 `dist/`(命名 `remote-agent-proxy-<版本>-<os>-<arch>`,版本号自动从 `types.go` 提取)。构建时通过 `-ldflags -X` 注入 `serverVersion` / `gitCommit`(工作区有未提交改动时带 `-dirty`)/ `buildTime`,运行态可用 `./remote-agent-proxy --version`、`remote_status`、`remote_get_env_info` 或 MCP 握手的 `serverInfo.version` 查看:
 
 ```bash
 ./build.sh                 # 构建当前平台
@@ -679,7 +689,15 @@ GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy
 
 ### 部署机控制脚本
 
-`control.sh` 是部署机上使用的控制脚本(部署目录放 `control.sh` + 二进制 + 可选的 `env.conf`):`start` / `stop`(SIGTERM 优雅退出,等待 `SHELL_API_SHUTDOWN_GRACE + 5` 秒后兜底 `kill -9`)/ `restart` / `status`(含运行中进程报告的版本与 commit)/ `foreground` / `build`(注入版本信息)/ `version` / `token`。`start.sh` 面向本地开发,额外带只读模式相关子命令。
+`control.sh` 是部署机上使用的控制脚本(部署目录放 `control.sh` + 二进制 + 可选的 `env.conf`):`start` / `stop`(SIGTERM 优雅退出,等待 `SHELL_API_SHUTDOWN_GRACE + 5` 秒后兜底 `kill -9`)/ `restart` / `status`(进程状态和 MCP 端点可达性)/ `foreground` / `build`(注入版本信息)/ `version`(磁盘上的二进制版本) / `token`。`start.sh` 面向本地开发,额外带只读模式相关子命令。脚本的端点检查面向本机 HTTP 部署;启用 TLS 时应通过对应的 HTTPS MCP 地址检查。
+
+`upgrade.sh` 保留并排目录、金丝雀验证和自动回滚流程,探测使用 `curl` 或 `wget` 发送 MCP `initialize`,并核对 `serverInfo.version`。哈希模式示例:
+
+```bash
+# 凭据由调用环境提供,不要写进脚本或命令历史
+# CHECK_TOKEN: 新服务的明文 Token;OLD_CHECK_TOKEN: 旧服务 Token 不同时设置
+bash upgrade.sh /path/to/old /path/to/new 8099 18099 1.6.0
+```
 
 仅依赖标准库加少量三方包(`google/uuid`、`mark3labs/mcp-go`、`golang.org/x/text`),无外部运行时依赖,单二进制部署。
 

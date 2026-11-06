@@ -118,11 +118,6 @@ func buildTokenAuth(token, tokenHash string) (*tokenAuth, string, error) {
 
 func AuthMiddleware(auth *tokenAuth, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/status" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		authz := r.Header.Get("Authorization")
 		if !strings.HasPrefix(authz, "Bearer ") {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "Missing or invalid Authorization header")
