@@ -44,13 +44,14 @@ type ServerProfile struct {
 	BuildTime string `json:"build_time"`
 	// ReadOnly reports read-only mode. When true every mutating tool is
 	// unregistered.
-	ReadOnly      bool     `json:"read_only"`
-	FSRoots       []string `json:"fs_roots,omitempty"`
-	DisabledTools []string `json:"disabled_tools,omitempty"`
-	MaxTimeoutSec int      `json:"max_timeout_sec"`
-	MaxOutput     int      `json:"max_output"`
-	RateLimit     int      `json:"rate_limit"`
-	RateBurst     int      `json:"rate_burst"`
+	ReadOnly       bool     `json:"read_only"`
+	FSRoots        []string `json:"fs_roots,omitempty"`
+	DisabledTools  []string `json:"disabled_tools,omitempty"`
+	MaxTimeoutSec  int      `json:"max_timeout_sec"`
+	MaxOutput      int      `json:"max_output"`
+	RateLimit      int      `json:"rate_limit"`
+	RateBurst      int      `json:"rate_burst"`
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
 	// CallBudgetSec is the longest one MCP tool call blocks; longer work
 	// returns an execution_id / wait_id to resume.
 	CallBudgetSec int `json:"call_budget_sec"`
@@ -123,19 +124,20 @@ func GetEnvInfo(cfg *Config) *EnvInfoResult {
 		LoadAverage:  getLoadAverage(),
 		Tools:        probeTools(probeToolList),
 		Server: ServerProfile{
-			Version:       serverVersion,
-			Commit:        gitCommit,
-			BuildTime:     buildTime,
-			ReadOnly:      cfg.ReadOnly,
-			FSRoots:       cfg.FSRoots,
-			DisabledTools: disabled,
-			MaxTimeoutSec: cfg.MaxTimeout,
-			MaxOutput:     cfg.MaxOutput,
-			RateLimit:     cfg.RateLimit,
-			RateBurst:     cfg.RateBurst,
-			CallBudgetSec: cfg.callBudgetSec(),
-			MaxWaitSec:    maxWaitTimeoutSec,
-			DenyCommands:  denyString(cfg),
+			Version:        serverVersion,
+			Commit:         gitCommit,
+			BuildTime:      buildTime,
+			ReadOnly:       cfg.ReadOnly,
+			FSRoots:        cfg.FSRoots,
+			DisabledTools:  disabled,
+			MaxTimeoutSec:  cfg.MaxTimeout,
+			MaxOutput:      cfg.MaxOutput,
+			RateLimit:      cfg.RateLimit,
+			RateBurst:      cfg.RateBurst,
+			TrustedProxies: trustedProxyStrings(cfg.TrustedProxies),
+			CallBudgetSec:  cfg.callBudgetSec(),
+			MaxWaitSec:     maxWaitTimeoutSec,
+			DenyCommands:   denyString(cfg),
 			Note: "This is the REMOTE host " + hostname + ": paths, working directories and commands are " +
 				"resolved here, not on the client machine.",
 		},

@@ -40,6 +40,7 @@ LOG_FILE="${SCRIPT_DIR}/remote-agent-proxy.log"
 : "${SHELL_API_MAX_OUTPUT:=1048576}"
 : "${SHELL_API_RATE_LIMIT:=120}"
 : "${SHELL_API_RATE_BURST:=60}"
+: "${SHELL_API_TRUSTED_PROXIES:=}"
 : "${SHELL_API_DEFAULT_SHELL:=bash}"
 : "${SHELL_API_FS_ROOT:=}"
 : "${SHELL_API_DISABLED_TOOLS:=}"
@@ -153,6 +154,7 @@ cmd_start() {
     export SHELL_API_MAX_OUTPUT
     export SHELL_API_RATE_LIMIT
     export SHELL_API_RATE_BURST
+    export SHELL_API_TRUSTED_PROXIES
     export SHELL_API_DEFAULT_SHELL
     export SHELL_API_FS_ROOT
     export SHELL_API_DISABLED_TOOLS
@@ -361,6 +363,7 @@ cmd_foreground() {
     export SHELL_API_MAX_OUTPUT
     export SHELL_API_RATE_LIMIT
     export SHELL_API_RATE_BURST
+    export SHELL_API_TRUSTED_PROXIES
     export SHELL_API_DEFAULT_SHELL
     export SHELL_API_FS_ROOT
     export SHELL_API_DISABLED_TOOLS
@@ -563,6 +566,7 @@ case "${1:-}" in
         echo "  SHELL_API_MAX_OUTPUT   输出字节上限（默认: 1048576）"
         echo "  SHELL_API_RATE_LIMIT   每客户端 IP 每分钟请求补充速率（默认: 120）"
         echo "  SHELL_API_RATE_BURST   每客户端 IP 突发容量（默认: 60）"
+        echo "  SHELL_API_TRUSTED_PROXIES 可信代理 IP/CIDR，逗号分隔（默认: 不信任转发头）"
         echo "  SHELL_API_DEFAULT_SHELL 默认 shell（默认: bash）"
         echo "  SHELL_API_FS_ROOT      文件沙箱根目录，逗号分隔可多个（默认: 不限制）"
         echo "  SHELL_API_DISABLED_TOOLS 禁用的 MCP 工具，逗号分隔（默认: 不禁用）"

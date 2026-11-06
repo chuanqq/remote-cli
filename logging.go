@@ -50,7 +50,7 @@ func parseLogLevel(s string) slog.Level {
 // written when the request completes carries them.
 type requestInfo struct {
 	ID     string
-	Remote string // peer host, port stripped
+	Remote string // 统一解析后的客户端 IP，无可信转发来源时为 TCP 对端
 
 	mu         sync.Mutex
 	tool       string
@@ -166,7 +166,7 @@ func isMCPStream(r *http.Request) bool {
 func LoggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		ri := &requestInfo{ID: newRequestID(), Remote: remoteHost(r.RemoteAddr)}
+		ri := &requestInfo{ID: newRequestID(), Remote: clientIPFromRequest(r)}
 		w.Header().Set("X-Request-Id", ri.ID)
 		rec := &statusRecorder{ResponseWriter: w}
 

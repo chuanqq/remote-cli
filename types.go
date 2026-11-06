@@ -8,7 +8,7 @@ import "fmt"
 // -X main.buildTime=...". They must stay package-level vars (not consts) for
 // -X to take effect.
 var (
-	serverVersion = "1.6.0"
+	serverVersion = "1.7.0"
 	gitCommit     = "unknown"
 	buildTime     = "unknown"
 )
@@ -130,7 +130,7 @@ type ErrorResponse struct {
 type AuditEntry struct {
 	ReqID            string // HTTP request correlation id (X-Request-Id)
 	ExecID           string // execution / job id, for command-running tools
-	SourceIP         string // real peer host
+	SourceIP         string // 可信代理校验后解析的客户端 IP
 	MCPSession       string // Mcp-Session-Id, MCP calls only
 	Tool             string // registered MCP tool name
 	SessionID        string // remote_session_* session

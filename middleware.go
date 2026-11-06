@@ -13,7 +13,7 @@ import (
 // RateLimiter is a per-host token bucket: capacity `burst`, refilled
 // continuously at `perMin` tokens per minute.
 //
-// The key is the peer HOST, never host:port. Keying on r.RemoteAddr (as an
+// The key is the resolved client IP, never host:port. Keying on r.RemoteAddr (as an
 // earlier version did) gave every new TCP connection a fresh full bucket, so
 // the limit never engaged: in production one client sent 85 requests in a
 // minute over 84 source ports against a configured 60/min.
@@ -134,7 +134,7 @@ func RateLimitMiddleware(rl *RateLimiter, next http.Handler) http.Handler {
 			return
 		}
 
-		ok, remaining, wait := rl.take(remoteHost(r.RemoteAddr))
+		ok, remaining, wait := rl.take(clientIPFromRequest(r))
 		if !ok {
 			waitMs := wait.Milliseconds() + 1 // round up: never early
 			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(float64(waitMs)/1000))))
