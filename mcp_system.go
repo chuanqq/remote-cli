@@ -71,7 +71,7 @@ func registerSystemTools(s *server.MCPServer, cfg *Config) {
 }
 
 // registerSessionTools adds the session lifecycle tools so MCP clients can
-// create/list/close persistent sessions without falling back to the REST API.
+// create/list/close persistent sessions through MCP.
 func registerSessionTools(s *server.MCPServer, sessions *SessionManager, cfg *Config) {
 	auditCall := func(ctx context.Context, sessionID, descriptor string) {
 		noteAudit(ctx, func(n *auditNote) { n.Command = descriptor; n.SessionID = sessionID })

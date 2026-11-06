@@ -17,7 +17,7 @@
 #   VERSION   覆盖版本号(默认从 types.go 的 serverVersion 提取)
 #
 # 版本信息通过 -ldflags -X 注入 main.serverVersion / main.gitCommit /
-# main.buildTime,运行态可经 --version、/api/status、remote_status、
+# main.buildTime,运行态可经 --version、remote_status、
 # remote_get_env_info 与 MCP 握手 serverInfo.version 查看。
 #
 # 说明: darwin 目标依赖 cgo(sysinfo_darwin.go),只能在 macOS 主机上构建;

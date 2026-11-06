@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -19,15 +18,13 @@ import (
 // every mutating capability is off and nothing can turn it back on — not the
 // tool blacklist, not a request parameter, not a newly registered tool.
 //
-// It is enforced in four independent layers, so a mistake in any single layer
+// It is enforced in two independent layers, so a mistake in any single layer
 // still cannot open a write path:
 //
 //	1. MCP registration — mutating tools are never registered (invisible).
-//	2. REST routing     — mutating endpoints answer 403 instead of executing.
-//	3. HTTP middleware  — any non-GET/HEAD request under /api/ is rejected.
-//	4. Operation guards — the mutating functions themselves fail closed.
+//	2. Operation guards — the mutating functions themselves fail closed.
 //
-// Layer 4 is the backstop: it lives inside WriteFileContent, MoveFile,
+// Layer 2 is the backstop: it lives inside WriteFileContent, MoveFile,
 // Executor.Execute, ... so a code path added later that forgets a registration
 // check still refuses to touch the host.
 // ---------------------------------------------------------------------------
@@ -59,20 +56,7 @@ var readOnlyTools = map[string]bool{
 	"remote_status":         true,
 }
 
-// mutatingRESTPaths lists the ServeMux patterns for REST endpoints that can
-// change host state. They are still routed under read-only mode (so clients get
-// a clear 403 rather than a confusing 404) but never reach the executor.
-// Trailing-slash entries are Go ServeMux subtree patterns and cover every path
-// below them.
-var mutatingRESTPaths = []string{
-	"/api/execute",
-	"/api/execute/stream",
-	"/api/sessions",
-	"/api/sessions/",   // subtree: {id}, {id}/execute
-	"/api/executions/", // subtree: {id} cancel
-}
-
-// readOnlyEnabled is the process-wide latch consulted by the layer-4 operation
+// readOnlyEnabled is the process-wide latch consulted by the layer-2 operation
 // guards. It is an atomic (not a Config field) for two reasons: the guards live
 // in leaf functions that have no *Config in scope, and a one-way latch cannot be
 // flipped back by later configuration handling.
@@ -92,7 +76,7 @@ func isReadOnly() bool {
 	return readOnlyEnabled.Load()
 }
 
-// guardReadOnly is the layer-4 backstop. Mutating operations call it first and
+// guardReadOnly is the layer-2 backstop. Mutating operations call it first and
 // return its error unchanged, so a forgotten registration check downgrades to a
 // refused call instead of a write.
 func guardReadOnly(op string) error {
@@ -194,12 +178,4 @@ func readOnlyHints() mcp.ToolOption {
 		t.Annotations.IdempotentHint = mcp.ToBoolPtr(true)
 		t.Annotations.OpenWorldHint = mcp.ToBoolPtr(false)
 	}
-}
-
-// readOnlyRESTDenied is the layer-2 handler substituted for every mutating REST
-// endpoint under read-only mode.
-func readOnlyRESTDenied(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-Read-Only", "true")
-	writeError(w, http.StatusForbidden, "read_only_mode",
-		"Server is in read-only mode: "+r.URL.Path+" is disabled")
 }

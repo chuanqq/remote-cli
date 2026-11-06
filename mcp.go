@@ -111,7 +111,7 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 	if cfg.toolEnabled("remote_session_execute") {
 		s.AddTool(mcp.NewTool("remote_session_execute",
 			mcp.WithDescription(fmt.Sprintf("Execute a shell command within a persistent session (create one with remote_session_create). Session cwd, shell, and env are applied; a successful bare `cd <dir>` persists the session cwd for subsequent calls, so commands can be short and free of path prefixes. Every call renews the session's idle TTL (session_expires_at in the result). Same execution semantics as remote_execute: the call blocks at most %ds; a command still running then returns state=running with execution_id (it is NOT killed) — fetch it with remote_execution_result instead of re-running it.", cfg.callBudgetSec())),
-			mcp.WithString("session_id", mcp.Required(), mcp.Description("Active session ID returned by remote_session_create or the REST session API.")),
+			mcp.WithString("session_id", mcp.Required(), mcp.Description("Active session ID returned by remote_session_create.")),
 			mcp.WithString("command", mcp.Required(), mcp.Description("Shell command to execute. A bare `cd <dir>` updates the session cwd on success."), mcp.MaxLength(10000)),
 			mcp.WithObject("environment", mcp.Description("Extra environment variables for this call (merged over the session env).")),
 			mcp.WithNumber("timeout_ms", mcp.Description(fmt.Sprintf("Kill the command after this many milliseconds. Default 30000, max %d.", cfg.MaxTimeout*1000))),

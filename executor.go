@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -144,10 +143,8 @@ func newCommand(ctx context.Context, shell, command, dir string, env map[string]
 	return cmd
 }
 
-// Execute runs req.Command and waits for it. ctx is the caller's request
-// context: when the client goes away the command is killed instead of running
-// on to its timeout unobserved. (MCP remote_execute uses Launch instead, which
-// is not bound to the request.)
+// Execute 执行命令并等待完成，调用方取消 ctx 时终止整个进程组。
+// MCP remote_execute 使用 Launch，执行过程独立于请求上下文。
 func (e *Executor) Execute(ctx context.Context, req ExecuteRequest) *ExecResult {
 	if ctx == nil {
 		ctx = context.Background()
@@ -179,7 +176,7 @@ func (e *Executor) execute(ctx context.Context, id string, req ExecuteRequest) *
 		}
 	}
 
-	// Layer-4 guard: shell execution is a write capability (a command can do
+	// Layer-2 guard: shell execution is a write capability (a command can do
 	// anything), so it is refused outright under read-only mode.
 	if err := guardReadOnly("shell execution"); err != nil {
 		return fail(err.Error())
@@ -294,100 +291,9 @@ func classifyWait(ctx context.Context, cmd *exec.Cmd, waitErr error) (int, bool,
 	case context.DeadlineExceeded:
 		return exitCode, true, ""
 	case context.Canceled:
-		return exitCode, false, "execution cancelled (remote_cancel, server shutdown, or the REST client disconnected)"
+		return exitCode, false, "execution cancelled (remote_cancel, server shutdown, or the client disconnected)"
 	}
 	return exitCode, false, ""
-}
-
-type StreamCallback func(event StreamEvent)
-
-func (e *Executor) ExecuteStream(ctx context.Context, req ExecuteRequest, callback StreamCallback) {
-	id := uuid.New().String()
-
-	failEvents := func(msg string) {
-		callback(StreamEvent{
-			Type:      "error",
-			Line:      msg,
-			Timestamp: time.Now().Format(time.RFC3339Nano),
-		})
-		callback(StreamEvent{
-			Type:      "exit",
-			ExitCode:  -1,
-			Timestamp: time.Now().Format(time.RFC3339Nano),
-		})
-	}
-
-	if err := guardReadOnly("shell execution (stream)"); err != nil {
-		failEvents(err.Error())
-		return
-	}
-	if err := e.config.checkCommand(req.Command); err != nil {
-		failEvents(err.Error())
-		return
-	}
-	if err := checkWorkingDir(req.WorkingDirectory); err != nil {
-		failEvents(err.Error())
-		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, e.resolveTimeout(req.TimeoutMs))
-	defer cancel()
-
-	e.running.Store(id, cancel)
-	defer e.running.Delete(id)
-
-	cmd := newCommand(ctx, e.resolveShell(req.Shell), req.Command, req.WorkingDirectory, req.Environment)
-
-	stdoutPipe, _ := cmd.StdoutPipe()
-	stderrPipe, _ := cmd.StderrPipe()
-
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		failEvents("failed to start command: " + err.Error())
-		return
-	}
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stdoutPipe)
-		for scanner.Scan() {
-			callback(StreamEvent{
-				Type:      "stdout",
-				Line:      scanner.Text(),
-				Timestamp: time.Now().Format(time.RFC3339Nano),
-			})
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			callback(StreamEvent{
-				Type:      "stderr",
-				Line:      scanner.Text(),
-				Timestamp: time.Now().Format(time.RFC3339Nano),
-			})
-		}
-	}()
-
-	wg.Wait()
-	err := cmd.Wait()
-	exitCode, _, _ := classifyWait(ctx, cmd, err)
-
-	callback(StreamEvent{
-		Type:      "exit",
-		ExitCode:  exitCode,
-		Duration:  time.Since(start).Milliseconds(),
-		Timestamp: time.Now().Format(time.RFC3339Nano),
-	})
 }
 
 func (e *Executor) Cancel(id string) bool {

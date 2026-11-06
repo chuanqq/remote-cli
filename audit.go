@@ -5,8 +5,8 @@ import (
 	"log/slog"
 )
 
-// AuditLogger writes one structured (type=audit) line per tool call / REST
-// command, through the same slog logger as the access log.
+// AuditLogger writes one structured (type=audit) line per MCP tool call,
+// through the same slog logger as the access log.
 type AuditLogger struct {
 	logger *slog.Logger
 }

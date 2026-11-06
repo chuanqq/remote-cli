@@ -177,7 +177,7 @@ cmd_start() {
     if is_readonly; then
         echo -e "  运行模式:  ${CYAN}只读（READ-ONLY，最高优先级）${NC}"
         echo "             仅保留 13 个只读工具；命令执行 / 写 / 编辑 / 删除 / 移动 / 复制 / 建目录 全部关闭"
-        echo "             REST 仅放行 /api/ 下的 GET / HEAD"
+        echo "             仅保留只读 MCP 工具"
     else
         echo -e "  运行模式:  ${YELLOW}读写（完整权限，等同交互式 shell）${NC}"
     fi
@@ -209,31 +209,9 @@ cmd_start() {
     if kill -0 "${pid}" 2>/dev/null; then
         log_info "服务启动成功 (PID: ${pid})"
         echo ""
-        # 哈希模式下脚本不知道明文 Token，示例命令用占位符提示用户替换
-        local bearer="${SHELL_API_TOKEN}"
-        [[ -n "${bearer}" ]] || bearer="<你的明文 Token>"
-        echo -e "${CYAN}快速验证:${NC}"
-        echo "  curl http://localhost:${SHELL_API_PORT}/api/status"
-        echo ""
-        if is_readonly; then
-            echo -e "${CYAN}只读模式校验（应返回 403 read_only_mode）:${NC}"
-            echo "  curl -i -X POST http://localhost:${SHELL_API_PORT}/api/execute \\"
-            echo "    -H \"Authorization: Bearer ${bearer}\" \\"
-            echo "    -H \"Content-Type: application/json\" \\"
-            echo "    -d '{\"command\":\"id\"}'"
-            echo ""
-            echo -e "${CYAN}只读模式确认（read_only 应为 true）:${NC}"
-            echo "  curl -s http://localhost:${SHELL_API_PORT}/api/status | grep read_only"
-        else
-            echo -e "${CYAN}执行命令:${NC}"
-            echo "  curl -X POST http://localhost:${SHELL_API_PORT}/api/execute \\"
-            echo "    -H \"Authorization: Bearer ${bearer}\" \\"
-            echo "    -H \"Content-Type: application/json\" \\"
-            echo "    -d '{\"command\":\"uname -a\"}'"
-        fi
-        echo ""
         echo -e "${CYAN}MCP 端点:${NC}"
         echo "  http://localhost:${SHELL_API_PORT}/mcp"
+        echo "  请使用 MCP 客户端通过该端点连接并调用工具"
     else
         log_error "服务启动失败，请查看日志: ${LOG_FILE}"
         rm -f "${PID_FILE}"
@@ -331,7 +309,7 @@ cmd_status() {
     echo "  PID:       ${pid}"
     # 实际监听端口。lsof 的 -p 与 -i 默认取并集，必须加 -a 取交集，否则会
     # 列出机器上所有监听进程（-P -n 禁用服务名/主机名解析）。探测不到时
-    # 回退到配置值，健康检查也用它。
+    # 回退到配置值，MCP 端点检查也用它。
     local port=""
     if command -v lsof &>/dev/null; then
         port=$(lsof -a -P -n -p "${pid}" -i TCP -s TCP:LISTEN -Fn 2>/dev/null \
@@ -340,20 +318,14 @@ cmd_status() {
     [[ -n "${port}" ]] || port="${SHELL_API_PORT:-unknown}"
     echo "  端口:      ${port}"
 
-    # 尝试健康检查（顺带读出服务端自报的运行模式，这是权威来源）
+    # MCP 端点探测（未携带凭据时应返回 401，说明服务已接受连接）
     if command -v curl &>/dev/null; then
-        local body resp
-        body=$(curl -s "http://localhost:${port}/api/status" 2>/dev/null || true)
-        resp=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${port}/api/status" 2>/dev/null || true)
-        if [[ "${resp}" == "200" ]]; then
-            echo "  健康检查:  正常 (HTTP ${resp})"
-            if [[ "${body}" == *'"read_only":true'* ]]; then
-                echo -e "  运行模式:  ${CYAN}只读（服务端确认）${NC}"
-            elif [[ "${body}" == *'"read_only":false'* ]]; then
-                echo -e "  运行模式:  ${YELLOW}读写（服务端确认）${NC}"
-            fi
+        local resp
+        resp=$(curl -s --max-time 3 -o /dev/null -w "%{http_code}" "http://localhost:${port}/mcp" 2>/dev/null || true)
+        if [[ "${resp}" == "401" ]]; then
+            echo "  MCP 检查:   正常（HTTP ${resp}，端点要求鉴权）"
         else
-            echo "  健康检查:  异常 (HTTP ${resp:-无响应})"
+            echo "  MCP 检查:   异常（HTTP ${resp:-无响应}）"
         fi
     fi
 
@@ -455,50 +427,35 @@ cmd_readonly_check() {
 
     log_info "校验目标: ${base}"
 
-    # 1. 服务端自报模式
-    local status_body
-    status_body=$(curl -s "${base}/api/status" 2>/dev/null || true)
-    if [[ "${status_body}" == *'"read_only":true'* ]]; then
-        echo -e "  ${GREEN}✓${NC} /api/status 自报 read_only=true"
-    else
-        echo -e "  ${RED}✗${NC} /api/status 未自报只读（服务可能未开启只读模式）"
-        ((failures++))
-    fi
-
-    # 2. REST 执行端点必须 403
-    local code
-    for path in "/api/execute" "/api/execute/stream" "/api/sessions"; do
-        code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${base}${path}" \
-            -H "Authorization: Bearer ${CHECK_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{"command":"id"}' 2>/dev/null || true)
-        if [[ "${code}" == "403" ]]; then
-            echo -e "  ${GREEN}✓${NC} POST ${path} -> 403"
-        else
-            echo -e "  ${RED}✗${NC} POST ${path} -> ${code:-无响应}（期望 403）"
-            ((failures++))
-        fi
-    done
-
-    # 3. MCP 工具清单里不能出现写工具
-    #    必须先完成 initialize 握手拿到 session id，否则服务返回
-    #    "Invalid session ID"——那段文本恰好不含任何工具名，会造成假通过。
-    local hdr_file tools sid
+    # 先验证握手声明的只读模式,再检查真实工具清单;错误响应不能算作通过。
+    local hdr_file tools sid init_body
     hdr_file=$(mktemp)
-    curl -s -D "${hdr_file}" -o /dev/null -X POST "${base}/mcp" \
+    init_body=$(curl -fsS --max-time 10 -D "${hdr_file}" -X POST "${base}/mcp" \
         -H "Authorization: Bearer ${CHECK_TOKEN}" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"readonly-check","version":"1"}}}' \
-        2>/dev/null || true
+        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"readonly-check","version":"1"}}}' \
+        2>/dev/null || true)
     sid=$(grep -i '^mcp-session-id:' "${hdr_file}" 2>/dev/null | tr -d '\r' | awk '{print $2}')
     rm -f "${hdr_file}"
 
     if [[ -z "${sid}" ]]; then
         echo -e "  ${RED}✗${NC} MCP initialize 握手失败，无法校验工具清单"
-        ((failures++))
+        failures=$((failures + 1))
     else
-        tools=$(curl -s -X POST "${base}/mcp" \
+        if grep -qE '"name"[[:space:]]*:[[:space:]]*"remote-shell-readonly"' <<<"${init_body}"; then
+            echo -e "  ${GREEN}✓${NC} MCP 握手确认只读模式"
+        else
+            echo -e "  ${RED}✗${NC} MCP 握手未声明只读模式"
+            failures=$((failures + 1))
+        fi
+        curl -fsS --max-time 10 -o /dev/null -X POST "${base}/mcp" \
+            -H "Authorization: Bearer ${CHECK_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json, text/event-stream" \
+            -H "Mcp-Session-Id: ${sid}" \
+            -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' 2>/dev/null || true
+        tools=$(curl -fsS --max-time 10 -X POST "${base}/mcp" \
             -H "Authorization: Bearer ${CHECK_TOKEN}" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json, text/event-stream" \
@@ -507,14 +464,14 @@ cmd_readonly_check() {
         # 必须确实拿到工具清单，否则不能判定"无写工具"
         if [[ "${tools}" != *'"tools"'* ]]; then
             echo -e "  ${RED}✗${NC} 未取到 MCP 工具清单，无法判定（响应: ${tools:0:60}）"
-            ((failures++))
+            failures=$((failures + 1))
         else
             local leaked=""
             for t in remote_execute remote_session_execute remote_cancel remote_write_file \
                      remote_edit_file remote_upload_base64 remote_move_file remote_copy_file \
                      remote_delete_file remote_make_dir remote_session_create \
                      remote_session_list remote_session_close remote_spawn remote_job_status \
-                     remote_job_list remote_job_logs remote_job_kill remote_wait_for; do
+                     remote_job_list remote_job_logs remote_job_kill remote_wait_for remote_execution_result; do
                 if [[ "${tools}" == *"\"${t}\""* ]]; then
                     leaked="${leaked} ${t}"
                 fi
@@ -525,11 +482,15 @@ cmd_readonly_check() {
                 echo -e "  ${GREEN}✓${NC} MCP 工具清单无写工具（共 ${n} 个只读工具）"
             else
                 echo -e "  ${RED}✗${NC} MCP 工具清单泄露写工具:${leaked}"
-                ((failures++))
+                failures=$((failures + 1))
             fi
         fi
     fi
 
+    if [[ -n "${sid}" ]]; then
+        curl -s --max-time 10 -o /dev/null -X DELETE "${base}/mcp" \
+            -H "Authorization: Bearer ${CHECK_TOKEN}" -H "Mcp-Session-Id: ${sid}" 2>/dev/null || true
+    fi
     echo ""
     if [[ ${failures} -eq 0 ]]; then
         log_info "只读模式校验通过"
@@ -584,7 +545,7 @@ case "${1:-}" in
         echo "  stop           停止服务"
         echo "  restart        重启服务"
         echo "  restart-ro     以只读模式重启"
-        echo "  status         查看服务运行状态（含服务端自报的运行模式）"
+        echo "  status         查看进程状态与 MCP 端点可达性"
         echo "  foreground     前台运行（Ctrl+C 停止）"
         echo "  foreground-ro  前台运行（只读模式）"
         echo "  build          仅编译二进制文件"

@@ -8,7 +8,7 @@ import "fmt"
 // -X main.buildTime=...". They must stay package-level vars (not consts) for
 // -X to take effect.
 var (
-	serverVersion = "1.5.0"
+	serverVersion = "1.6.0"
 	gitCommit     = "unknown"
 	buildTime     = "unknown"
 )
@@ -77,14 +77,6 @@ type ExecuteResponse struct {
 	SessionExpiresAt string `json:"session_expires_at,omitempty"`
 }
 
-type StreamEvent struct {
-	Type      string `json:"type"`
-	Line      string `json:"line,omitempty"`
-	ExitCode  int    `json:"exit_code,omitempty"`
-	Duration  int64  `json:"duration_ms,omitempty"`
-	Timestamp string `json:"timestamp"`
-}
-
 type SessionCreateRequest struct {
 	WorkingDirectory string            `json:"working_directory,omitempty"`
 	Environment      map[string]string `json:"environment,omitempty"`
@@ -140,7 +132,7 @@ type AuditEntry struct {
 	ExecID           string // execution / job id, for command-running tools
 	SourceIP         string // real peer host
 	MCPSession       string // Mcp-Session-Id, MCP calls only
-	Tool             string // registered tool name, or REST endpoint label
+	Tool             string // registered MCP tool name
 	SessionID        string // remote_session_* session
 	Command          string // command line or synthetic "op path" descriptor
 	WorkingDirectory string
@@ -152,7 +144,6 @@ type AuditEntry struct {
 	Error            string // failure reason, when the call failed
 	// State is the execution / wait state (running, completed, pending, ...).
 	State string
-	// Client is the MCP clientInfo "name/version" from the handshake, which
-	// tells agent-driven calls apart from humans using the REST API.
+	// Client is the MCP clientInfo "name/version" from the handshake.
 	Client string
 }
