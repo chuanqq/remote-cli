@@ -109,12 +109,13 @@ func newHTTPHandler(mcpHandler http.Handler, auth *tokenAuth, cfg *Config, logge
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcpHandler)
 
-	// 请求顺序：Logging -> RateLimit -> Auth -> Drain -> mux。
+	// 请求顺序：ClientIP -> Logging -> RateLimit -> Auth -> Drain -> mux。
 	var handler http.Handler = mux
 	handler = drainStreamsMiddleware(streamsCtx, handler)
 	handler = AuthMiddleware(auth, handler)
 	handler = RateLimitMiddleware(NewRateLimiter(cfg.RateLimit, cfg.RateBurst), handler)
-	return LoggingMiddleware(logger, handler)
+	handler = LoggingMiddleware(logger, handler)
+	return ClientIPMiddleware(cfg.TrustedProxies, handler)
 }
 
 // gracefulShutdown stops accepting connections, lets in-flight executions
@@ -189,6 +190,7 @@ func logStartup(logger *slog.Logger, cfg *Config, authMode string) {
 		"max_output", cfg.MaxOutput,
 		"rate_limit_per_min", cfg.RateLimit,
 		"rate_burst", cfg.RateBurst,
+		"trusted_proxies", trustedProxyStrings(cfg.TrustedProxies),
 		"call_budget_sec", cfg.callBudgetSec(),
 		"mcp_heartbeat_sec", int(cfg.MCPHeartbeat.Seconds()),
 		"job_dir", cfg.JobDir,

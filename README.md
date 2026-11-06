@@ -87,6 +87,12 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 连通后客户端 `tools/list` 应能看到全部 33 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 32 个)。服务端只提供上述 MCP 端点,不存在独立的 REST HTTP 接口。
 
+## v1.7.0 升级说明
+
+新增可信代理配置 `SHELL_API_TRUSTED_PROXIES`,支持逗号分隔的 IP 和 CIDR。只有 TCP 对端属于该列表时才读取 `X-Forwarded-For` / `X-Real-IP`,解析后的客户端 IP 统一用于限流、访问日志和 MCP 审计。默认不信任任何转发头,直连部署无需调整;非法代理配置会拒绝启动。详细规则及 nginx 示例见下文。
+
+部署脚本新增 `./control.sh mcp-prompt [URL] [服务名]`,可输出一段用于 agent 客户端添加 MCP 服务的 prompt。URL 可预先配置为 `MCP_PUBLIC_URL`;哈希鉴权时用 `CHECK_TOKEN` 提供客户端明文 Token,缺失时输出交互获取凭据的占位符,不输出服务端哈希。
+
 ## v1.6.0 升级说明
 
 本版本删除全部旧 REST 接口,包括 `/api/status`、`/api/execute`、`/api/execute/stream`、`/api/sessions*` 和 `/api/executions/*`。携带有效凭据访问这些路径时返回 404;未鉴权请求统一返回 401。唯一 HTTP 入口为 `/mcp`,所有 MCP 请求均要求 Bearer Token。
@@ -115,6 +121,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_MAX_OUTPUT` | `1048576` | stdout / stderr 字节上限(`max_output_bytes` 不能超过它) |
 | `SHELL_API_RATE_LIMIT` | `120` | 限流令牌桶补充速率(每客户端 IP 每分钟),按 IP 计数(不含端口);`GET /mcp` 长连接不计数 |
 | `SHELL_API_RATE_BURST` | `60` | 限流令牌桶容量(每客户端 IP 可连续突发的请求数) |
+| `SHELL_API_TRUSTED_PROXIES` | (空) | 可提供客户端 IP 的可信 TCP 代理,逗号分隔 IP/CIDR;默认忽略所有转发头。非法配置拒绝启动 |
 | `SHELL_API_DEFAULT_SHELL` | `bash` | 默认 shell |
 | `SHELL_API_FS_ROOT` | (空) | 文件操作沙箱根目录,支持逗号分隔多个目录前缀,留空则不限制(等同 shell 信任级别) |
 | `SHELL_API_DISABLED_TOOLS` | (空) | 工具黑名单,逗号分隔的 MCP 工具名,启动时不注册,对客户端不可见 |
@@ -540,7 +547,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 #### `remote_get_env_info`
 
-一次性环境画像,无参数:OS/内核/架构、主机名、用户、shell、locale、内存/负载、36 个常用工具链(python3、rg、rsync、mysql 等)的可用性与版本、服务端配置(只读模式标志、FSRoots、工具黑名单、限额)。会话开局调一次,替代一串 `which` / `--version` / `uname` 探测。
+一次性环境画像,无参数:OS/内核/架构、主机名、用户、shell、locale、内存/负载、36 个常用工具链(python3、rg、rsync、mysql 等)的可用性与版本、服务端配置(只读模式标志、FSRoots、工具黑名单、限额、可信代理)。会话开局调一次,替代一串 `which` / `--version` / `uname` 探测。
 
 ## 安全机制
 
@@ -628,15 +635,35 @@ SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-
 
 如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,漏写一个工具名就可能留下一条写通路。
 
+### 可信代理与客户端 IP
+
+`SHELL_API_TRUSTED_PROXIES` 指定哪些 TCP 对端可以提供客户端 IP,支持 IPv4、IPv6 和 CIDR。单个地址按 `/32` 或 `/128` 处理,CIDR 会规范化到网段,IPv4-mapped IPv6 会统一为 IPv4。默认列表为空,即使请求带有转发头,仍只使用 TCP 对端地址。列表中的非法条目会导致启动失败,不会静默跳过。
+
+```bash
+# 仅信任本机 nginx 的回环来源,不默认信任整个内网
+SHELL_API_TRUSTED_PROXIES=127.0.0.1/32,::1/128 ./remote-agent-proxy
+```
+
+解析规则:
+
+1. 先检查 TCP 对端是否匹配可信代理列表;不匹配时忽略全部转发头。
+2. 优先解析 `X-Forwarded-For`。多个同名头按顺序合并,所有值必须是纯 IP;从右向左跨过可信代理,取遇到的第一个不可信地址。若整条链都可信,取最左侧地址。
+3. 只有 `X-Forwarded-For` 不存在时,才读取单个 `X-Real-IP`。
+4. 空值、非法 IP、`unknown`、端口、引号、IPv6 zone 等格式错误会回退到 TCP 对端。已存在但非法的 `X-Forwarded-For` 不会再让 `X-Real-IP` 覆盖;重复的 `X-Real-IP` 也不接受。`Forwarded` 等其他头不参与解析。
+
+客户端 IP 在请求进入日志和限流前解析一次,同时供 MCP 上下文及异步执行审计使用,不会改写原始 `RemoteAddr`。因此代理后的不同客户端拥有独立限流桶,访问日志和审计日志中的 `remote` 也保持一致。启动日志和 `remote_get_env_info.server.trusted_proxies` 会显示规范化后的可信代理配置(未配置时环境画像中省略该字段)。
+
+只配置实际的代理地址或必要的最小网段,不要使用 `0.0.0.0/0`、`::/0` 或把所有内网客户端都标为代理。代理应覆盖外部传入的来源头,或在已验证的代理链末尾追加真实对端;否则真实来源无法可靠判定。该配置只控制来源头的信任,不替代 Bearer 鉴权,也不限制服务监听地址或阻止后端端口被直接访问。
+
 ### 审计日志
 
 服务的所有日志都是一行一个 JSON 对象(`log/slog`),输出到 stderr。两类记录通过 `req_id` 关联,同一请求的 `req_id` 也在响应头 `X-Request-Id` 中返回:
 
 - **访问日志** `type=access`:`req_id / remote / method / path / status / bytes / dur_ms`,MCP 请求另带 `mcp_method`(`initialize` / `tools/list` / `tools/call` …)、`tool` 与 `mcp_session`。401 / 429 也会记录。`GET /mcp` 长连接只在 `SHELL_API_LOG_LEVEL=debug` 下记录
-- **审计日志** `type=audit`:每次工具调用一行,由统一的 MCP 工具中间件写入,字段 `req_id / exec_id / remote / mcp_session / client / tool / session_id / command / working_directory / exit_code / dur_ms / output_bytes / truncated / timed_out / state / error`。`client` 是 MCP 握手 `clientInfo` 的 `name/version`;超出调用预算的命令先记一行 `state=running`,结束时再以同一 `exec_id` 记一行最终状态。`tool` 一律为注册工具名,`remote` 为真实对端 IP(不含端口),失败时 `error` 给出原因
+- **审计日志** `type=audit`:每次工具调用一行,由统一的 MCP 工具中间件写入,字段 `req_id / exec_id / remote / mcp_session / client / tool / session_id / command / working_directory / exit_code / dur_ms / output_bytes / truncated / timed_out / state / error`。`client` 是 MCP 握手 `clientInfo` 的 `name/version`;超出调用预算的命令先记一行 `state=running`,结束时再以同一 `exec_id` 记一行最终状态。`tool` 一律为注册工具名,`remote` 为统一解析后的客户端 IP(不含端口;无可信转发来源时使用 TCP 对端),失败时 `error` 给出原因
 
 ```json
-{"time":"...","level":"INFO","msg":"audit","type":"audit","req_id":"r-4497e438","remote":"172.26.97.60","tool":"remote_execute","command":"echo hi","exit_code":0,"dur_ms":5,"output_bytes":3,"timed_out":false,"exec_id":"04034b32-...","mcp_session":"mcp-session-..."}
+{"time":"...","level":"INFO","msg":"audit","type":"audit","req_id":"r-4497e438","remote":"198.51.100.24","tool":"remote_execute","command":"echo hi","exit_code":0,"dur_ms":5,"output_bytes":3,"timed_out":false,"exec_id":"04034b32-...","mcp_session":"mcp-session-..."}
 ```
 
 - `command` 字段在落盘前自动脱敏:`mysql -p<密码>`、`Authorization: Bearer <token>`、`password= / token= / secret= / api_key=` 等形态替换为 `***`
@@ -689,15 +716,103 @@ GOOS=linux GOARCH=amd64 go build -o remote-agent-proxy
 
 ### 部署机控制脚本
 
-`control.sh` 是部署机上使用的控制脚本(部署目录放 `control.sh` + 二进制 + 可选的 `env.conf`):`start` / `stop`(SIGTERM 优雅退出,等待 `SHELL_API_SHUTDOWN_GRACE + 5` 秒后兜底 `kill -9`)/ `restart` / `status`(进程状态和 MCP 端点可达性)/ `foreground` / `build`(注入版本信息)/ `version`(磁盘上的二进制版本) / `token`。`start.sh` 面向本地开发,额外带只读模式相关子命令。脚本的端点检查面向本机 HTTP 部署;启用 TLS 时应通过对应的 HTTPS MCP 地址检查。
+`control.sh` 是部署机上使用的控制脚本(部署目录放 `control.sh` + 二进制 + 可选的 `env.conf`):`start` / `stop`(SIGTERM 优雅退出,等待 `SHELL_API_SHUTDOWN_GRACE + 5` 秒后兜底 `kill -9`)/ `restart` / `status`(进程状态和 MCP 端点可达性)/ `foreground` / `build`(注入版本信息)/ `version`(磁盘上的二进制版本) / `token` / `mcp-prompt`(输出客户端添加服务的 prompt)。`start.sh` 面向本地开发,额外带只读模式相关子命令。脚本的端点检查面向本机 HTTP 部署;启用 TLS 时应通过对应的 HTTPS MCP 地址检查。
 
 `upgrade.sh` 保留并排目录、金丝雀验证和自动回滚流程,探测使用 `curl` 或 `wget` 发送 MCP `initialize`,并核对 `serverInfo.version`。哈希模式示例:
 
 ```bash
 # 凭据由调用环境提供,不要写进脚本或命令历史
 # CHECK_TOKEN: 新服务的明文 Token;OLD_CHECK_TOKEN: 旧服务 Token 不同时设置
-bash upgrade.sh /path/to/old /path/to/new 8099 18099 1.6.0
+bash upgrade.sh /path/to/old /path/to/new 8099 18099 1.7.0
 ```
+
+### nginx HTTPS 反向代理示例
+
+以下域名、证书路径和凭据均为占位示例,后端使用默认端口 8080。nginx 负责 TLS 终止,通过同机 HTTP 访问 MCP;应用仍验证客户端 Bearer Token。
+
+服务端 `env.conf` 示例(哈希值须替换为 `hash-token` 子命令实际生成的结果):
+
+```bash
+SHELL_API_PORT=8080
+SHELL_API_TOKEN_HASH='sha256:<SALT_HEX>:<HASH_HEX>'
+SHELL_API_TRUSTED_PROXIES=127.0.0.1/32,::1/128
+SHELL_API_TLS_CERT=
+SHELL_API_TLS_KEY=
+```
+
+nginx 示例:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name mcp.example.com;
+
+    ssl_certificate     /etc/nginx/ssl/example/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/example/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location = /mcp {
+        # 不附加 URI 或尾斜杠,保留后端的 /mcp 路径。
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_set_header Host $host;
+        proxy_set_header Authorization $http_authorization;
+        # 单层入口代理覆盖来源头,不保留客户端伪造的地址链。
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_buffering off;
+        proxy_cache off;
+        gzip off;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        send_timeout 3600s;
+        proxy_intercept_errors off;
+        proxy_next_upstream off;
+        client_max_body_size 32m;
+    }
+}
+```
+
+Streamable HTTP 使用 JSON-RPC 和 SSE,不需要 WebSocket Upgrade 配置。请求与响应中的 `Mcp-Session-Id`、协议版本等头按 nginx 默认规则透传。`proxy_buffering off` 保证事件和心跳及时送达;`proxy_read_timeout` 是上游读取的空闲超时,不会改变客户端超时或命令的 `timeout_ms`。32m 限制针对单次 JSON 请求,上传分块应计入 base64 膨胀。
+
+已有 HTTPS 站点只需把 location 加入原 server 块,或在该 server 块内 include 片段;不要将裸 location 放入 http 层的 `conf.d/*.conf`。TLS 由 nginx 处理时,后端的证书和私钥变量同时留空。程序目前仍监听所有地址,应通过防火墙或安全组限制后端端口直连;可信代理配置本身不会收紧监听范围。
+
+客户端直接连接 `https://mcp.example.com/mcp`,继续发送 `Authorization: Bearer <CLIENT_TOKEN>`。应用会使用可信 nginx 提供的来源 IP 分别限流和审计。若 nginx 前面还有代理/CDN,需单独核实并配置该链路的真实地址来源,不能直接套用任意外部转发头。
+
+应用 nginx 配置前执行 `nginx -t`,检查通过后再重载。无凭据请求应返回 401;进一步通过 MCP initialize、tools/list 和可用的 remote_status 验证协议及工具调用,并检查日志中的 `remote` 是否为预期客户端 IP。
+
+### 输出添加 MCP 的 agent prompt
+
+部署机上执行以下命令,将输出整段复制到需要添加服务的 agent 终端:
+
+```bash
+./control.sh mcp-prompt https://mcp.example.com/mcp example-mcp
+```
+
+也可在 `env.conf` 中预先设置脚本专用的 URL 和服务名,之后一条命令输出:
+
+```bash
+MCP_PUBLIC_URL=https://mcp.example.com/mcp
+MCP_SERVER_NAME=example-mcp
+# 将上述两项写入 env.conf 后执行:
+./control.sh mcp-prompt
+```
+
+命令参数优先于 `MCP_PUBLIC_URL` / `MCP_SERVER_NAME`,服务名默认 `remote-shell`,仅允许字母、数字、下划线和连字符。URL 必须是对客户端可达的完整 HTTP/HTTPS MCP 地址,脚本不推测公网地址。该命令仅输出 prompt,不会启动/重启服务、修改客户端配置或发起网络请求。
+
+输出包含 Streamable HTTP 类型、URL、服务名、Authorization 请求头及握手验证要求,供 agent 按所在客户端支持的配置格式添加。明文模式自动使用 `SHELL_API_TOKEN`;如提供 `CHECK_TOKEN`,则优先使用它。哈希模式可通过临时客户端环境变量补全凭据:
+
+```bash
+# CLIENT_TOKEN 是占位符,实际使用客户端持有的明文 Token。
+CHECK_TOKEN='<CLIENT_TOKEN>' ./control.sh mcp-prompt https://mcp.example.com/mcp example-mcp
+```
+
+未取得明文 Token 时,输出 `Bearer <CLIENT_TOKEN>` 占位符并要求 agent 在添加前交互获取。脚本不会输出或把 `SHELL_API_TOKEN_HASH` 当成 Bearer 凭据。`CHECK_TOKEN` 仅供本次操作使用,不要为此将客户端明文 Token 长期写入哈希模式的服务端配置。带有真实 Token 的输出应仅用于受信任的客户端配置,不要提交到代码仓库或公开分享。
 
 仅依赖标准库加少量三方包(`google/uuid`、`mark3labs/mcp-go`、`golang.org/x/text`),无外部运行时依赖,单二进制部署。
 

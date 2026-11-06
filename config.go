@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,6 +28,8 @@ type Config struct {
 	// takes over.
 	RateBurst    int
 	DefaultShell string
+	// TrustedProxies 仅允许这些 TCP 对端提供客户端 IP，空列表不信任任何转发头。
+	TrustedProxies []netip.Prefix
 	// LogLevel filters the structured log: debug|info|warn|error. The MCP GET
 	// keep-alive stream is only logged at debug.
 	LogLevel string
@@ -96,6 +99,12 @@ func LoadConfig() *Config {
 		ShutdownGrace: time.Duration(getEnvInt("SHELL_API_SHUTDOWN_GRACE", 30)) * time.Second,
 		JobDir:        getEnv("SHELL_API_JOB_DIR", filepath.Join(os.TempDir(), "remote-agent-proxy-jobs")),
 	}
+	trusted, err := parseTrustedProxies(getEnv("SHELL_API_TRUSTED_PROXIES", ""))
+	if err != nil {
+		log.Fatalf("SHELL_API_TRUSTED_PROXIES: %v", err)
+	}
+	cfg.TrustedProxies = trusted
+
 	if b := getEnvInt("SHELL_API_CALL_BUDGET", defaultCallBudgetSec); b > 0 {
 		cfg.CallBudget = time.Duration(b) * time.Second
 	} else {

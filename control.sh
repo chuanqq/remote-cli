@@ -2,7 +2,7 @@
 #
 # remote-agent-proxy 部署机控制脚本（与线上 /home/work/chuanqz/agent-assistant/control.sh 同源）
 #
-# 用法: ./control.sh {start|stop|restart|status|foreground|build|version|token|help}
+# 用法: ./control.sh {start|stop|restart|status|foreground|build|version|token|mcp-prompt|help}
 #
 # 部署目录只需: control.sh + remote-agent-proxy(二进制) + env.conf(可选，覆盖下方默认值)。
 # build 子命令需在源码目录执行，会通过 -ldflags 注入版本 / commit / 构建时间，
@@ -94,7 +94,7 @@ export_env() {
     local v
     for v in SHELL_API_LOG_LEVEL SHELL_API_MCP_HEARTBEAT SHELL_API_JOB_DIR \
              SHELL_API_DENY_COMMANDS SHELL_API_BLOCK_JUMP_HOST SHELL_API_READONLY \
-             SHELL_API_CALL_BUDGET; do
+             SHELL_API_CALL_BUDGET SHELL_API_TRUSTED_PROXIES; do
         if [[ -n "${!v:-}" ]]; then export "${v?}"; fi
     done
     # 不设置 TLS 相关变量，确保使用 HTTP
@@ -340,6 +340,55 @@ cmd_foreground() {
 }
 
 # ──────────────────────────────────────────────
+# 命令: mcp-prompt  输出给 agent 客户端的 MCP 添加指令
+# ──────────────────────────────────────────────
+json_quote() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '"%s"' "$value"
+}
+
+cmd_mcp_prompt() {
+    local url="${1:-${MCP_PUBLIC_URL:-}}"
+    local name="${2:-${MCP_SERVER_NAME:-remote-shell}}"
+    local token="${CHECK_TOKEN:-${SHELL_API_TOKEN:-}}"
+    local auth="Bearer <CLIENT_TOKEN>" authority
+    if [[ $# -gt 2 || -z "$url" ]]; then
+        log_error "用法: $0 mcp-prompt <客户端可达的 MCP URL> [服务名]，或配置 MCP_PUBLIC_URL"
+        return 1
+    fi
+    authority=${url#*://}
+    authority=${authority%%/*}
+    authority=${authority%%\?*}
+    if [[ "$url" != http://* && "$url" != https://* ]] ||
+       [[ "$url" =~ [[:space:][:cntrl:]] || "$url" == *'#'* || -z "$authority" || "$authority" == *'@'* ]]; then
+        log_error "MCP URL 必须是无空白、片段或内嵌凭据的完整 HTTP/HTTPS 地址"
+        return 1
+    fi
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]] || [[ "$token" =~ [[:cntrl:]] ]]; then
+        log_error "服务名只能包含字母、数字、下划线或连字符；Token 不能包含控制字符"
+        return 1
+    fi
+    if [[ -n "$token" ]]; then
+        auth="Bearer $token"
+    fi
+
+    printf '请在当前 agent 客户端中添加以下 MCP 服务，传输方式为 Streamable HTTP。\n'
+    printf '请按当前客户端支持的格式配置，并优先保存到客户端用户级配置，不要提交到代码仓库。\n'
+    if [[ -z "$token" ]]; then
+        printf '添加前请让我通过交互输入提供客户端明文 Token，替换 <CLIENT_TOKEN> 后再连接。\n'
+        printf '服务端仅存 Token Hash 时无法据此生成客户端凭据，请使用我提供的明文 Token。\n'
+    else
+        printf '以下配置包含客户端鉴权凭据，请仅用于本机客户端配置，不要公开分享。\n'
+    fi
+    printf '\n```json\n{\n  "mcpServers": {\n    %s: {\n      "type": "http",\n      "url": %s,\n      "headers": {"Authorization": %s}\n    }\n  }\n}\n```\n' \
+        "$(json_quote "$name")" "$(json_quote "$url")" "$(json_quote "$auth")"
+    printf '\n如客户端使用其他配置结构，请使用等价的 HTTP URL 和 Authorization 请求头配置。\n'
+    printf '完成后通过 MCP initialize 和 tools/list 验证连接，并报告添加结果。\n'
+}
+
+# ──────────────────────────────────────────────
 # 命令: token  显示当前 Token
 # ──────────────────────────────────────────────
 cmd_token() {
@@ -388,8 +437,11 @@ case "${1:-}" in
     token)
         cmd_token
         ;;
+    mcp-prompt)
+        cmd_mcp_prompt "${@:2}"
+        ;;
     help|--help|-h)
-        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|help}"
+        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|mcp-prompt|help}"
         echo ""
         echo "  start       后台启动服务"
         echo "  stop        优雅停止服务（SIGTERM，超时后 kill -9）"
@@ -399,6 +451,7 @@ case "${1:-}" in
         echo "  build       编译二进制文件（注入版本/commit/构建时间，需在源码目录）"
         echo "  version     显示二进制版本"
         echo "  token       显示当前 Token"
+        echo "  mcp-prompt [URL] [服务名]  输出可复制到 agent 终端的 MCP 添加指令"
         echo "  help        显示此帮助"
         echo ""
         echo "环境变量（可在脚本内或 env.conf 文件中设置）:"
@@ -410,6 +463,7 @@ case "${1:-}" in
         echo "  SHELL_API_MAX_OUTPUT      输出字节上限（默认: 1048576）"
         echo "  SHELL_API_RATE_LIMIT      每客户端 IP 每分钟请求补充速率（默认: 120）"
         echo "  SHELL_API_RATE_BURST      每客户端 IP 突发容量（默认: 60）"
+        echo "  SHELL_API_TRUSTED_PROXIES 可信代理 IP/CIDR，逗号分隔（默认: 不信任转发头）"
         echo "  SHELL_API_DEFAULT_SHELL   默认 shell（默认: bash）"
         echo "  SHELL_API_FS_ROOT         文件沙箱根目录，逗号分隔可多个（默认: 不限制）"
         echo "  SHELL_API_DISABLED_TOOLS  禁用的 MCP 工具，逗号分隔（默认: 不禁用）"
@@ -421,10 +475,16 @@ case "${1:-}" in
         echo "  SHELL_API_JOB_DIR         remote_spawn 后台任务日志目录（默认: \$TMPDIR/remote-agent-proxy-jobs）"
         echo "  SHELL_API_BLOCK_JUMP_HOST 设为 true 拦截 ssh/gssh/scp/sftp/sshpass 跳板命令（默认: 关闭）"
         echo "  SHELL_API_DENY_COMMANDS   自定义命令拦截 RE2 正则（默认: 空）"
+        echo ""
+        echo "mcp-prompt 专用参数（不改变服务端配置）:"
+        echo "  MCP_PUBLIC_URL   客户端可达的完整 MCP URL，可由命令参数覆盖"
+        echo "  MCP_SERVER_NAME  客户端中的服务名（默认: remote-shell）"
+        echo "  CHECK_TOKEN      客户端明文 Token，优先于 SHELL_API_TOKEN；哈希模式可用它生成完整指令"
+        echo "  未提供明文 Token 时输出占位符，由 agent 在添加前交互获取；不会输出 Token Hash"
         ;;
     *)
         echo "未知命令: ${1:-}"
-        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|help}"
+        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|mcp-prompt|help}"
         exit 1
         ;;
 esac

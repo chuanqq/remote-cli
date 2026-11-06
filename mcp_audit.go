@@ -13,10 +13,8 @@ import (
 // ---------------------------------------------------------------------------
 // MCP request context & unified audit
 //
-// mcpHTTPContext (WithHTTPContextFunc) injects the real peer address into the
-// context of every MCP request. Previously the source IP was taken from
-// X-Forwarded-For / X-Real-IP only and fell back to the literal "mcp", so all
-// 3584 production audit records carried source_ip="mcp".
+// mcpHTTPContext 将已校验可信代理边界的客户端 IP 注入 MCP 上下文，
+// 与访问日志和限流使用同一个请求级解析结果。
 //
 // withAudit (a tool-handler middleware) audits EVERY registered tool in one
 // place: tool name (the registered name, never a hand-typed short form),
@@ -29,7 +27,7 @@ type sourceIPKey struct{}
 
 // mcpHTTPContext is the StreamableHTTPServer context func.
 func mcpHTTPContext(ctx context.Context, r *http.Request) context.Context {
-	ctx = context.WithValue(ctx, sourceIPKey{}, remoteHost(r.RemoteAddr))
+	ctx = context.WithValue(ctx, sourceIPKey{}, clientIPFromRequest(r))
 	if ri := requestInfoFrom(r.Context()); ri != nil {
 		if sid := r.Header.Get(server.HeaderKeySessionID); sid != "" {
 			ri.setMCPSession(sid)
@@ -38,8 +36,7 @@ func mcpHTTPContext(ctx context.Context, r *http.Request) context.Context {
 	return ctx
 }
 
-// sourceIPFrom returns the peer host injected by mcpHTTPContext (or by the
-// access-log middleware).
+// sourceIPFrom 返回 mcpHTTPContext 或访问日志中间件记录的统一客户端 IP。
 func sourceIPFrom(ctx context.Context) string {
 	if ip, ok := ctx.Value(sourceIPKey{}).(string); ok && ip != "" {
 		return ip
