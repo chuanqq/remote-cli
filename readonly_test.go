@@ -258,7 +258,14 @@ func TestReadOnlyToolListsConsistent(t *testing.T) {
 // read-only accounting silently drifts from reality.
 func TestToolInventoryMatchesRegistrations(t *testing.T) {
 	registered := map[string]bool{}
-	for _, f := range []string{"mcp.go", "mcp_fileops.go", "mcp_system.go", "mcp_jobs.go", "mcp_executions.go"} {
+	files, err := filepath.Glob("mcp*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
 		src, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)

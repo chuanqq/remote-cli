@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -77,8 +79,9 @@ type SearchContentRequest struct {
 	Offset        int    // skip this many results first: next_offset of a truncated call
 	MaxFileSize   int64
 	IncludeHidden bool
-	Encoding      string    // force the source encoding; empty detects it per file (and per line)
-	Deadline      time.Time // stop scanning at this time (truncated, with a hint); zero = no limit
+	Encoding      string          // force the source encoding; empty detects it per file (and per line)
+	Deadline      time.Time       // stop scanning at this time (truncated, with a hint); zero = no limit
+	Context       context.Context // 可取消的扫描生命周期；与单次 MCP 调用分离
 }
 
 type SearchMatch struct {
@@ -91,27 +94,30 @@ type SearchMatch struct {
 
 // SearchFile is one file of a files_with_matches / count search.
 type SearchFile struct {
-	File  string `json:"file"`
-	Count int    `json:"count,omitempty"` // count mode: matching lines in the file
+	File    string `json:"file"`
+	Count   int    `json:"count,omitempty"`   // count mode: matching lines in the file
+	Partial bool   `json:"partial,omitempty"` // 文件未扫描完，count 只是已扫描部分
 }
 
 // SearchContentResult puts the results last, so a client that cuts an
 // oversized result keeps the summary and the cursor.
 type SearchContentResult struct {
-	Path          string         `json:"path"`
-	Pattern       string         `json:"pattern"`
-	OutputMode    string         `json:"output_mode"`
-	TotalMatches  int            `json:"total_matches,omitempty"` // matching lines seen (offset ones included); not counted in files_with_matches mode
-	FilesMatched  int            `json:"files_matched"`
-	FilesSearched int            `json:"files_searched"`
-	FilesSkipped  int            `json:"files_skipped"`          // see skip_reasons
-	SkipReasons   map[string]int `json:"skip_reasons,omitempty"` // binary, too_large, unreadable, not_regular, symlink_dir, outside_roots, broken_symlink
-	SymlinkDirs   []string       `json:"symlink_dirs,omitempty"` // symlinked directories met and not entered (search them by path)
-	Truncated     bool           `json:"truncated"`              // stopped early: max_results, the output cap or the time budget
-	NextOffset    int            `json:"next_offset,omitempty"`  // offset of the next page when truncated by max_results / output cap
-	Hint          string         `json:"hint,omitempty"`
-	Files         []SearchFile   `json:"files,omitempty"`
-	Matches       []SearchMatch  `json:"matches,omitempty"`
+	Path           string         `json:"path"`
+	Pattern        string         `json:"pattern"`
+	OutputMode     string         `json:"output_mode"`
+	TotalMatches   int            `json:"total_matches"`             // count 模式是全扫描总命中行数，与文件计数分页独立
+	CountsComplete *bool          `json:"counts_complete,omitempty"` // count 模式：没有超时或跳过的文件，统计才完整
+	FilesMatched   int            `json:"files_matched"`
+	FilesSearched  int            `json:"files_searched"`
+	LongLines      int            `json:"long_lines,omitempty"`   // 超过单行扫描上限
+	FilesSkipped   int            `json:"files_skipped"`          // see skip_reasons
+	SkipReasons    map[string]int `json:"skip_reasons,omitempty"` // binary, too_large, unreadable, not_regular, symlink_dir, outside_roots, broken_symlink
+	SymlinkDirs    []string       `json:"symlink_dirs,omitempty"` // symlinked directories met and not entered (search them by path)
+	Truncated      bool           `json:"truncated"`              // stopped early: max_results, the output cap or the time budget
+	NextOffset     int            `json:"next_offset,omitempty"`  // offset of the next page when truncated by max_results / output cap
+	Hint           string         `json:"hint,omitempty"`
+	Files          []SearchFile   `json:"files,omitempty"`
+	Matches        []SearchMatch  `json:"matches,omitempty"`
 
 	context bool // context lines were requested: format=text separates groups with --
 }
@@ -128,6 +134,7 @@ type searchOpts struct {
 	encoding         string
 	includeHidden    bool
 	deadline         time.Time
+	ctx              context.Context
 	roots            []string
 }
 
@@ -136,7 +143,7 @@ func newSearchOpts(req SearchContentRequest, roots []string) (*searchOpts, error
 		return nil, errors.New("pattern is empty")
 	}
 	o := &searchOpts{pattern: req.Pattern, mode: req.OutputMode, includeHidden: req.IncludeHidden,
-		encoding: req.Encoding, deadline: req.Deadline, roots: roots}
+		encoding: req.Encoding, deadline: req.Deadline, ctx: req.Context, roots: roots}
 	expr := req.Pattern
 	if req.FixedStrings {
 		expr = regexp.QuoteMeta(expr)
@@ -193,6 +200,11 @@ func clampContext(n int) int { return min(max(n, 0), maxSearchContext) }
 // overlapping context is emitted once, and every skipped file is counted by
 // reason. No matches is a success, not an error. Paths are sandboxed by roots.
 func SearchContent(req SearchContentRequest, roots []string) (*SearchContentResult, error) {
+	return scanTextFiles(req, roots, nil)
+}
+
+// scanTextFiles 复用沙箱、遍历和逐行解码；consume 非空时交给只读聚合处理每行。
+func scanTextFiles(req SearchContentRequest, roots []string, consume func(path string, line int, text string, cut bool)) (*SearchContentResult, error) {
 	abs, err := validatePath(req.Path, roots)
 	if err != nil {
 		return nil, err
@@ -205,7 +217,7 @@ func SearchContent(req SearchContentRequest, roots []string) (*SearchContentResu
 	if err != nil {
 		return nil, err
 	}
-	s := &searchRun{opts: o, res: &SearchContentResult{Path: abs, Pattern: req.Pattern, OutputMode: o.mode,
+	s := &searchRun{opts: o, consume: consume, res: &SearchContentResult{Path: abs, Pattern: req.Pattern, OutputMode: o.mode,
 		context: o.before+o.after > 0}}
 	if !info.IsDir() {
 		s.searchFile(abs, info) // an explicitly named file is searched whatever its name
@@ -225,6 +237,7 @@ type searchRun struct {
 	outBytes int // text bytes of the returned lines
 	stopped  bool
 	timedOut bool
+	consume  func(path string, line int, text string, cut bool)
 }
 
 func (s *searchRun) skip(reason string) {
@@ -242,7 +255,7 @@ func (s *searchRun) skip(reason string) {
 func (s *searchRun) walk(root string) error {
 	o := s.opts
 	return walkTree(root, func(p string, d fs.DirEntry, err error) error {
-		if s.stopped {
+		if s.stopped || s.pastDeadline() {
 			return filepath.SkipAll
 		}
 		if err != nil {
@@ -315,61 +328,102 @@ type ctxLine struct {
 	text string
 }
 
-// searchFile scans one file line by line.
-func (s *searchRun) searchFile(path string, info os.FileInfo) {
+// scanReader 也在超长行的分块读取之间检查取消，避免丢弃长行时越过任务时限。
+type scanReader struct {
+	io.Reader
+	run *searchRun
+}
+
+func (r *scanReader) Read(p []byte) (int, error) {
+	if r.run.pastDeadline() {
+		return 0, context.DeadlineExceeded
+	}
+	return r.Reader.Read(p)
+}
+
+// scanLines 返回文件是否读到末尾；回调返回 false 可提前结束当前文件。
+func (s *searchRun) scanLines(path string, info os.FileInfo, consume func(int, string, bool) bool) bool {
 	o := s.opts
 	switch {
+	case s.pastDeadline():
+		return false
 	case !info.Mode().IsRegular():
 		s.skip("not_regular")
-		return
+		return false
 	case info.Size() > o.maxFileSize:
 		s.skip("too_large")
-		return
-	case s.pastDeadline():
-		return
+		return false
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		s.skip("unreadable")
-		return
+		return false
 	}
 	defer f.Close()
-	br := bufio.NewReaderSize(f, 64<<10)
+	br := bufio.NewReaderSize(&scanReader{Reader: f, run: s}, 64<<10)
 	head, _ := br.Peek(64 << 10)
 	if looksBinary(head) {
 		s.skip("binary")
-		return
+		return false
 	}
 	fileEnc := o.encoding
 	if fileEnc == "" {
 		fileEnc = detectEncoding(head)
 	}
 	s.res.FilesSearched++
-
-	var ring []ctxLine // the last o.before lines, oldest first
-	cur := -1          // index in res.Matches of the match collecting after-context
-	afterLeft, emitted, count := 0, 0, 0
 	var buf []byte
-	for n := 1; !s.stopped; n++ {
-		line, used, err := readCappedLine(br, buf[:0])
+	for n := 1; ; n++ {
+		if s.stopped || (n == 1 || n%256 == 0) && s.pastDeadline() {
+			return false
+		}
+		line, used, readErr := readCappedLine(br, buf[:0])
 		buf = line
-		if used == 0 && err != nil {
-			break
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			if !s.timedOut {
+				s.skip("unreadable")
+			}
+			return false // 错误或取消中断的半行不能参与计数或数值聚合
 		}
-		if n%4096 == 0 && s.pastDeadline() {
-			break
+		if used > 0 {
+			cut := used > searchLineBuf
+			if cut {
+				s.res.LongLines++
+			}
+			if !consume(n, decodeLine(line, fileEnc, o.encoding), cut) {
+				return false
+			}
 		}
-		text := decodeLine(line, fileEnc, o.encoding)
+		if errors.Is(readErr, io.EOF) {
+			return true
+		}
+	}
+}
+
+// searchFile 在公共流式读取器上收集匹配或聚合输入。
+func (s *searchRun) searchFile(path string, info os.FileInfo) {
+	if s.consume != nil {
+		s.scanLines(path, info, func(n int, text string, cut bool) bool {
+			s.consume(path, n, text, cut)
+			return true
+		})
+		return
+	}
+	o := s.opts
+	var ring []ctxLine
+	cur := -1
+	afterLeft, emitted, count := 0, 0, 0
+	longLinesBefore := s.res.LongLines
+	complete := s.scanLines(path, info, func(n int, text string, cut bool) bool {
 		if o.re.MatchString(text) {
 			if o.mode == SearchContentMode && s.full() {
-				s.stop() // a full page and one more match: truncated
-				break
+				s.stop()
+				return false
 			}
 			count++
 			switch o.mode {
 			case SearchFilesMode:
-				s.addFile(path, 0)
-				return
+				s.addFile(path, 0, false)
+				return false
 			case SearchContentMode:
 				if s.skipped < o.skip {
 					s.skipped++
@@ -401,36 +455,41 @@ func (s *searchRun) searchFile(path string, info os.FileInfo) {
 			}
 			ring = append(ring, ctxLine{n, excerpt(text, nil, maxSearchLineLen)})
 		}
-		if err != nil {
-			break
-		}
-	}
+		return true
+	})
 	if count == 0 {
 		return
 	}
 	switch o.mode {
 	case SearchCountMode:
-		s.addFile(path, count)
+		s.addFile(path, count, !complete || s.res.LongLines > longLinesBefore)
 	case SearchContentMode:
 		s.res.FilesMatched++
 		s.res.TotalMatches += count
 	}
 }
 
-// addFile records a result of the files_with_matches / count modes; a full
-// page stops the search instead.
-func (s *searchRun) addFile(path string, count int) {
-	if s.full() {
+// count 的总数覆盖全扫描，文件明细单独分页；其他模式仍在满页后停止。
+func (s *searchRun) addFile(path string, count int, partial bool) {
+	if s.opts.mode == SearchCountMode {
+		s.res.FilesMatched++
+		s.res.TotalMatches += count
+	} else if s.full() {
 		s.stop()
 		return
+	} else {
+		s.res.FilesMatched++
 	}
-	s.res.FilesMatched++
-	s.res.TotalMatches += count
 	if s.skipped < s.opts.skip {
 		s.skipped++
 		return
 	}
-	s.res.Files = append(s.res.Files, SearchFile{File: path, Count: count})
+	if s.full() {
+		s.res.Truncated = true
+		s.res.NextOffset = s.opts.skip + s.returned
+		return
+	}
+	s.res.Files = append(s.res.Files, SearchFile{File: path, Count: count, Partial: partial})
 	s.outBytes += len(path) + 16
 	s.returned++
 }
@@ -448,7 +507,8 @@ func (s *searchRun) stop() {
 }
 
 func (s *searchRun) pastDeadline() bool {
-	if s.opts.deadline.IsZero() || time.Now().Before(s.opts.deadline) {
+	ctxDone := s.opts.ctx != nil && s.opts.ctx.Err() != nil
+	if !ctxDone && (s.opts.deadline.IsZero() || time.Now().Before(s.opts.deadline)) {
 		return false
 	}
 	s.stopped, s.timedOut = true, true
@@ -509,12 +569,16 @@ func excerpt(text string, re *regexp.Regexp, limit int) string {
 // finish explains a truncated or empty result.
 func (s *searchRun) finish() {
 	r, o := s.res, s.opts
+	if o.mode == SearchCountMode {
+		complete := !s.timedOut && r.FilesSkipped == 0 && r.LongLines == 0
+		r.CountsComplete = &complete
+	}
 	var hints []string
 	switch {
 	case s.timedOut:
 		r.NextOffset = 0
-		hints = append(hints, fmt.Sprintf("time budget reached after %d files: the results are partial; "+
-			"narrow path / include_glob, or use output_mode=files_with_matches", r.FilesSearched))
+		hints = append(hints, fmt.Sprintf("scan deadline reached after %d files: the results are partial; "+
+			"increase timeout_ms or narrow path / include_glob", r.FilesSearched))
 	case r.Truncated:
 		hints = append(hints, fmt.Sprintf("more results: call again with the same arguments and offset=%d", r.NextOffset))
 		if s.outBytes >= maxSearchOutputBytes {
@@ -528,6 +592,9 @@ func (s *searchRun) finish() {
 			hints = append(hints, "no file matched include_glob / exclude_glob (a glob without / matches base names; "+
 				"\"dir/*.conf\" and \"**/*.conf\" match paths below the search path)")
 		}
+	}
+	if r.LongLines > 0 {
+		hints = append(hints, fmt.Sprintf("%d lines exceed %d bytes: only their prefixes were scanned", r.LongLines, searchLineBuf))
 	}
 	if n := r.SkipReasons["too_large"]; n > 0 {
 		hints = append(hints, fmt.Sprintf("%d files over max_file_size=%d were skipped", n, o.maxFileSize))

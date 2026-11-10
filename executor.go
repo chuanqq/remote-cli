@@ -30,10 +30,12 @@ type Executor struct {
 	// back inline (see executions.go).
 	mu    sync.Mutex
 	execs map[string]*Execution
+	// 只读扫描独立于 shell 执行，在服务退出时统一取消。
+	scans *ScanManager
 }
 
 func NewExecutor(cfg *Config) *Executor {
-	return &Executor{config: cfg, execs: make(map[string]*Execution)}
+	return &Executor{config: cfg, execs: make(map[string]*Execution), scans: NewScanManager()}
 }
 
 type ExecResult struct {

@@ -4,9 +4,9 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/chuanqq/remote-cli)](https://goreportcard.com/report/github.com/chuanqq/remote-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-**English:** A single-binary MCP (Model Context Protocol) server written in Go that lets AI agents (such as Claude Code) securely operate remote hosts. It exposes 33 dedicated tools through one Streamable HTTP MCP endpoint — shell execution with persistent sessions, file read/write/edit, server-side content search, log tailing with cursors and follow, process/port inspection and an environment profile — so the agent rarely needs to fall back to raw shell commands.
+**English:** A single-binary MCP (Model Context Protocol) server written in Go that lets AI agents (such as Claude Code) securely operate remote hosts. It exposes 35 dedicated tools through one Streamable HTTP MCP endpoint — shell execution with persistent sessions, file read/write/edit, server-side content search, log tailing with cursors and follow, process/port inspection and an environment profile — so the agent rarely needs to fall back to raw shell commands.
 
-一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 33 个专用工具:命令执行与持久会话、超出调用时长可续取的执行与服务端等待、后台任务、文件读写编辑与批量读取、服务端内容搜索与文件/目录对比、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
+一个用 Go 编写的 MCP(Model Context Protocol)服务端,让 AI Agent(如 Claude Code)通过网络安全地操作远程主机。通过 Streamable HTTP 暴露 35 个专用工具:命令执行与持久会话、超出调用时长可续取的执行与服务端等待、后台任务、文件读写编辑与批量读取、服务端内容搜索与文件/目录对比、带游标与 follow 的日志跟踪、进程/端口洞察与环境画像——绝大多数远程操作无需再拼 shell 命令。
 
 编译产物为单二进制,零外部运行时依赖;TLS 与 Bearer Token 鉴权开箱即用。
 
@@ -18,7 +18,7 @@
 - **后台任务与等待**:`remote_spawn` 启动脱离调用的后台任务并按 job id 查询/读日志/终止;`remote_wait_for` 服务端等待文件/日志/进程/端口/命令条件,满足即返回
 - **持久会话**:维护 cwd / shell / 环境变量,`cd` 后自动同步工作目录,带 TTL 自动回收;会话的创建/列出/销毁均有对应 MCP 工具
 - **文件操作**:读 / 写 / 编辑 / 列目录 / stat / 移动 / 复制 / 删除 / 建目录,支持 UTF-8 / GBK / GB2312 / GB18030 编码互转与自动探测,大文件支持 base64 分块上传下载;写入类操作返回 sha256/mode 自检,可选 bash/python 语法 lint
-- **内容搜索与日志**:服务端实现的内容正则搜索、文件名查找、大日志尾部/增量/跟随读取,不依赖目标机 grep/rg/find
+- **内容搜索、聚合与日志**:服务端内容正则搜索、逐文件行数统计、分列过滤及数值极值/top-N 聚合；搜索和聚合支持后台续取；另有文件名查找、大日志尾部/增量/跟随读取，不依赖目标机 grep/rg/find
 - **主机洞察**:进程枚举、监听端口检查、一次性环境画像(36 个常用工具链探测)
 - **运维**:SIGTERM 优雅退出、构建时注入版本与 commit、MCP 长连接心跳
 - **只读模式**:`SHELL_API_READONLY=true` 一键将服务降级为纯读取代理,工具注册与操作兜底两层强制、运行时不可恢复,优先级高于其他所有配置
@@ -85,7 +85,15 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 }
 ```
 
-连通后客户端 `tools/list` 应能看到全部 33 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 32 个)。服务端只提供上述 MCP 端点,不存在独立的 REST HTTP 接口。
+连通后客户端 `tools/list` 应能看到全部 35 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 34 个)。服务端只提供上述 MCP 端点,不存在独立的 REST HTTP 接口。
+
+## v1.8.0 升级说明
+
+新增只读数值聚合工具 `remote_aggregate`：按分隔符取第 N 列，以行正则和字段条件过滤，在服务器上直接计算 count、min、max 与 top-N，避免下载完整日志。数值比较保留大整数精度，结果带文件名和行号。
+
+`remote_search_content` 的 count 模式始终返回 `total_matches`，包括零命中；总命中行数、总命中文件数覆盖完整扫描，逐文件 `files[].count` 明细单独分页。`counts_complete` 区分完整统计与超时、跳过文件或超长行造成的部分统计，单文件未扫完时标记 `partial`。
+
+搜索和聚合支持独立的 `timeout_ms`（默认 300000，最大 3600000），不再在单次调用预算耗尽时终止扫描。等待到 `wait_ms` 后仍在运行会返回 `scan_id`，用新增的 `remote_scan_result` 续取同一任务；`wait_ms: 0` 可立即返回。两个新工具均在只读模式可用，总工具数为 35，只读工具数为 15。升级后客户端需刷新 MCP 工具清单。
 
 ## v1.7.0 升级说明
 
@@ -127,13 +135,13 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `SHELL_API_DISABLED_TOOLS` | (空) | 工具黑名单,逗号分隔的 MCP 工具名,启动时不注册,对客户端不可见 |
 | `SHELL_API_LOG_LEVEL` | `info` | 日志级别 `debug` / `info` / `warn` / `error`;`GET /mcp` 长连接的访问行只在 `debug` 下输出 |
 | `SHELL_API_MCP_HEARTBEAT` | `30` | MCP `GET /mcp` 推送流心跳(ping)间隔秒数,防止中间设备空闲断连;`0` 关闭 |
-| `SHELL_API_CALL_BUDGET` | `50` | 单次 MCP 工具调用最长阻塞秒数,应小于客户端请求超时(TypeScript SDK 默认 60s)。超出的命令不被杀,返回 `state=running` + `execution_id` 后续取;等待返回 `state=pending` + `wait_id` 续等;`follow_seconds` 也以此为上限 |
+| `SHELL_API_CALL_BUDGET` | `50` | 单次 MCP 工具调用最长阻塞秒数,应小于客户端请求超时(TypeScript SDK 默认 60s)。超出的命令不被杀,返回 `state=running` + `execution_id` 后续取;等待返回 `state=pending` + `wait_id` 续等;搜索/聚合返回 `scan_id` 后续取；`follow_seconds` 也以此为上限 |
 | `SHELL_API_SHUTDOWN_GRACE` | `30` | 收到 SIGTERM/SIGINT 后,执行中命令(含超出调用时长仍在跑的)的最长宽限秒数,超时后连同进程组一并杀掉 |
 | `SHELL_API_JOB_DIR` | `$TMPDIR/remote-agent-proxy-jobs` | `remote_spawn` 后台任务的日志目录 |
 | `SHELL_API_BLOCK_JUMP_HOST` | (空) | 设为 `true` 时拦截 `ssh` / `gssh` / `scp` / `sftp` / `sshpass` 跳板命令(在跳板机上执行的命令不进入本服务审计) |
 | `SHELL_API_DENY_COMMANDS` | (空) | 自定义命令拦截 RE2 正则,命中即拒绝执行(作用于 execute / session_execute / spawn / wait_for 的 command_exit0);正则非法时拒绝启动 |
 
-## 工具一览(33 个)
+## 工具一览(35 个)
 
 | 分组 | 工具 | 只读模式 |
 | --- | --- | --- |
@@ -142,11 +150,11 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | 后台任务与等待 | `remote_spawn` `remote_job_status` `remote_job_list` `remote_job_logs` `remote_job_kill` `remote_wait_for` | ✗ |
 | 文件读写 | `remote_write_file` `remote_edit_file` `remote_upload_base64` | ✗ |
 | 文件读写 | `remote_read_file` `remote_read_files` `remote_list_dir` `remote_stat` `remote_download_base64` | ✓ |
-| 搜索、对比与日志 | `remote_search_content` `remote_find_files` `remote_diff` `remote_tail_log` | ✓ |
+| 搜索、聚合、对比与日志 | `remote_search_content` `remote_aggregate` `remote_scan_result` `remote_find_files` `remote_diff` `remote_tail_log` | ✓ |
 | 文件管理 | `remote_move_file` `remote_copy_file` `remote_delete_file` `remote_make_dir` | ✗ |
 | 主机洞察 | `remote_list_processes` `remote_check_port` `remote_get_env_info` | ✓ |
 
-"只读模式"列标 ✓ 的 13 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 20 个会被强制下线。
+"只读模式"列标 ✓ 的 15 个工具在 `SHELL_API_READONLY=true` 下仍然可用,标 ✗ 的 20 个会被强制下线。
 
 下面按分组给出每个工具的参数与用法。参数表中"必填"列标 `*` 的为必填;示例为 MCP `tools/call` 的 `arguments` 内容。
 
@@ -409,18 +417,78 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 | `fixed_strings` | boolean | | 按字面文本搜索(同 `grep -F`),默认 false |
 | `context_lines` | number | | 每个命中附前后各 N 行,默认 0,最大 20;重叠的上下文只输出一次 |
 | `before_lines` / `after_lines` | number | | 分别指定前 / 后行数(同 `grep -B` / `-A`),覆盖 `context_lines` |
-| `max_results` | number | | 每页结果数(命中行或文件),默认 200,最大 5000;输出另有 64KB 上限 |
+| `max_results` | number | | 每页明细数(命中行或文件),默认 200,最大 5000;输出另有 64KB 上限；count 模式仍扫描全量文件计算总数 |
 | `offset` | number | | 跳过前 N 个结果:截断时传上次的 `next_offset` 翻页 |
 | `max_file_size` | number | | 跳过超过该字节数的文件,默认 256MB |
 | `include_hidden` | boolean | | 包含点文件/点目录,默认 false |
 | `encoding` | string | | 强制源编码,缺省按文件、按行自动探测 |
 | `format` | string | | `json`(默认)或 `text`(同 `grep -n` 的分组输出),见下文「文本格式输出」 |
 
-超长行只返回命中附近约 2000 字节的片段。扫描接近调用预算时提前停止,返回部分结果并在 `hint` 中说明。
+`count` 的 `total_matches` 是命中行数（一行出现多次匹配仍计 1），`files_matched` 是命中文件数，`files[].count` 是本页各命中文件的行数。总数不受 `max_results` 或 `offset` 影响；即使明细 `truncated: true`，`counts_complete: true` 仍表示总数已扫完。`counts_complete: false` 表示超时、跳过文件或超长行影响了统计，文件中途停止时该项 `partial: true`。没有命中也明确返回 `total_matches: 0`。
+
+超长行只返回命中附近约 2000 字节的片段；原行超过约 1MB 时只匹配前缀，`long_lines` 和 `hint` 会说明。搜索的 `timeout_ms` / `wait_ms` 与 `remote_scan_result` 用法见下文；扫描超出本次等待预算后继续运行，只有扫描自身超时或被取消才提前停止。
 
 ```json
 {"path": "/data/app", "pattern": "FATAL|ERROR", "include_glob": ["*.log"], "exclude_glob": ["*.gz"], "before_lines": 3, "after_lines": 1}
 ```
+
+#### `remote_aggregate`
+
+服务端流式分列、过滤与数值聚合，一次扫描同时计算 `count`、`min`、`max` 和 top-N。读取范围、glob、编码识别、二进制文件跳过与软链接沙箱规则均与 `remote_search_content` 相同，不依赖 shell、awk 或目标机运行时，只读模式下可用。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | * | 文件或递归扫描的目录 |
+| `field` | number | * | 数值列号，从 1 开始，必须是整数，最大 1024 |
+| `delimiter` | string | | 字面分隔符，如 `"|"`、逗号、制表符；省略或空串按连续空白分列，字面模式保留空列，不解析 CSV 引号；最大 256 字节 |
+| `pattern` | string | | 可选整行 RE2 预过滤；省略时逐行处理全部文本 |
+| `fixed_strings` | boolean | | 把行 pattern 按字面文本匹配 |
+| `ignore_case` | boolean | | 行 pattern 及文本字段过滤忽略大小写 |
+| `filters` | array | | 最多 32 个 `{field, op, value}` 条件，全部通过才保留该行；value 为字符串，保留大整数精度 |
+| `top_n` | number | | top 明细数量，默认 10，最大 1000；不限制扫描量或 count/min/max |
+| `sort_order` | string | | `desc`（默认）取最大 N 条，`asc` 取最小 N 条；数值并列时保留先出现的行 |
+| `include_content` | boolean | | 在记录中附带最多约 200 字节的行片段，默认 false；默认仅返回原数值、文件和行号 |
+| `include_glob` / `exclude_glob` | array | | 文件与目录过滤，语义与搜索工具相同 |
+| `max_file_size` | number | | 跳过超过该字节数的文件，默认 256MB |
+| `include_hidden` | boolean | | 扫描点文件和点目录，默认 false |
+| `encoding` | string | | 强制源编码；省略时按文件、按行自动识别 |
+| `timeout_ms` / `wait_ms` | number | | 整次扫描超时与本次等待时间，见下一节 |
+| `format` | string | | `json`（默认）或 `text` |
+
+字段过滤的 `eq` / `ne` / `contains` / `regex` 按文本比较，`gt` / `ge` / `lt` / `le` 按数值精确比较。数值支持符号、小数和科学计数法；尾数最多 4096 位、指数绝对值最大 10000，拒绝 NaN、Inf、十六进制和分数。目标数值字段会去掉两端空白，返回的 `value` 始终是字符串，保留其余原始写法，避免客户端把大整数转成浮点数后丢失精度。
+
+`count` 是通过整行及字段过滤且目标字段为有效数值的行数；`lines_scanned` 是扫描行数，`lines_matched` 是通过整行及字段过滤的行数。缺列、无效数值和超过约 1MB 的行分别计入 `lines_skipped.missing_field` / `invalid_number` / `line_cut`；超长行整行跳过，不把截断的字段当作极值。没有有效数值时返回 `count: 0` 和空 `top`，省略 min/max。
+
+`min` / `max` / `top[]` 均返回 `{value, file, line, content?}`，`scan_complete` 表示没有超时、跳过文件或超长行；`truncated` 表示扫描提前结束。top 明细另受约 64KB 响应窗口限制，超限时 `top_truncated: true`，总计数和极值仍保留，`hint` 说明范围。
+
+```json
+{"path": "/data/app/log", "include_glob": ["*.log*"], "delimiter": "|", "field": 7, "filters": [{"field": 3, "op": "eq", "value": "charge"}, {"field": 7, "op": "gt", "value": "100"}], "top_n": 20, "timeout_ms": 900000, "wait_ms": 0}
+```
+
+该例在服务器上过滤第 3 列为 charge、且第 7 列大于 100 的记录，统计有效行数及第 7 列的最小值、最大值和最大 20 条记录。
+
+#### 长扫描与 `remote_scan_result`
+
+`remote_search_content` 和 `remote_aggregate` 共用以下参数，完整扫描无需由调用方按天拆批：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `timeout_ms` | number | 扫描自身的总超时，默认 300000（5 分钟），范围 1–3600000（1 小时），独立于命令超时配置 |
+| `wait_ms` | number | 本次调用等待时间；默认接近调用预算并预留响应时间，超出会被限制；0 表示立即返回 |
+
+扫描完成时保持原工具的顶层结果字段，额外返回 `scan_id`、`tool`、`state`、`started_at`、`elapsed_ms`、`timeout_ms`。尚未完成时返回 `state: "running"` 与 `scan_id`，用以下调用继续等待；续取可切换 `format: "json"` / `"text"`。客户端断连或请求取消不会终止任务，也不应重新提交同一查询。
+
+```json
+{"path": "/data/app/log", "pattern": "ERROR", "include_glob": ["app.log.2026110{1,2,3}*"], "output_mode": "count", "timeout_ms": 900000, "wait_ms": 0}
+```
+
+```json
+{"scan_id": "上次返回的 scan_id", "wait_ms": 45000, "format": "text"}
+```
+
+`remote_scan_result` 的参数为 `scan_id`（省略时列出近期任务及路径）、`wait_ms`（0 只查状态）、`cancel`（true 时取消此读取任务，需要 scan_id）和 `format`。任务状态为 `running` / `completed` / `timed_out` / `cancelled` / `failed`；超时或取消时保留已经计算的部分结果，`failed` 带错误。`completed` 表示任务正常结束，仍需检查 `counts_complete`、`skip_reasons`、`truncated` 等结果字段确认覆盖范围。
+
+最多同时运行 4 个扫描；已完成结果最多保留最近 16 份，完成后保留 30 分钟，服务重启后清空。列表可用于找回丢失回复后的 scan_id，重复取结果不会重新读取文件。服务退出会取消在途只读扫描。如果通过黑名单禁用 `remote_scan_result`，搜索和聚合退回调用预算内的同步扫描，超时返回部分结果，不留下无法取回的后台任务。`remote_diff`、`remote_find_files` 保持各自原有的扫描方式。
 
 #### `remote_find_files`
 
@@ -563,7 +631,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 
 ### 只读模式(ReadOnly)
 
-`SHELL_API_READONLY` 是本服务**优先级最高**的开关。开启后服务退化为纯读取代理:只保留 13 个读取类工具,命令执行、会话、写 / 编辑 / 删除 / 移动 / 复制 / 建目录全部下线,且**运行时无法恢复**——它不受 `SHELL_API_DISABLED_TOOLS`、请求参数或任何后续配置影响。
+`SHELL_API_READONLY` 是本服务**优先级最高**的开关。开启后服务退化为纯读取代理:只保留 15 个读取类工具,命令执行、会话、写 / 编辑 / 删除 / 移动 / 复制 / 建目录全部下线,且**运行时无法恢复**——它不受 `SHELL_API_DISABLED_TOOLS`、请求参数或任何后续配置影响。
 
 ```bash
 # 一键开启(取值 1 / true / yes / on / enabled,大小写不敏感)
@@ -585,11 +653,12 @@ SHELL_API_TOKEN=xxx SHELL_API_READONLY=true ./remote-agent-proxy
 
 第 1 层用的是**白名单**(`readonly.go` 的 `readOnlyTools`):将来新增的工具在未被显式审计并加入白名单前一律禁用,漏改代码的后果是"少一个读工具",而不是"多一个写通路"。第 2 层保证即使注册层被绕过(例如后续误加了一个未走 `toolEnabled` 的注册点),底层操作仍然拒绝执行。
 
-只读模式下允许的 13 个工具:
+只读模式下允许的 15 个工具:
 
 ```
 remote_read_file  remote_read_files  remote_list_dir  remote_stat
-remote_search_content  remote_find_files  remote_diff  remote_tail_log
+remote_search_content  remote_aggregate  remote_scan_result
+remote_find_files  remote_diff  remote_tail_log
 remote_download_base64  remote_list_processes  remote_check_port
 remote_get_env_info  remote_status
 ```
@@ -599,7 +668,7 @@ remote_get_env_info  remote_status
 ```bash
 SHELL_API_READONLY=true \
 SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
-./remote-agent-proxy      # 最终只剩 11 个工具
+./remote-agent-proxy      # 最终只剩 13 个工具
 ```
 
 模式对客户端是自描述的:MCP handshake 里 server name 变为 `remote-shell-readonly`,instructions 写明主机名、FSRoot、可用工具清单和读取约定(分页游标、RE2 交替写法、glob 规则);每个只读工具都带 `readOnlyHint: true` / `destructiveHint: false` 注解(mcp-go 默认是相反值,Claude Code 据此判断工具能否并发执行),`remote_status` 与 `remote_get_env_info` 返回 `read_only: true`。
@@ -631,7 +700,7 @@ SHELL_API_DISABLED_TOOLS=remote_download_base64,remote_list_processes \
 SHELL_API_DISABLED_TOOLS=remote_delete_file,remote_upload_base64 ./remote-agent-proxy
 ```
 
-可禁用的工具名即上文列出的 33 个。
+可禁用的工具名即上文列出的 35 个。
 
 如果目标就是"只读服务",**请直接用 `SHELL_API_READONLY=true`**,不要靠手写黑名单:黑名单只作用于 MCP 工具注册,漏写一个工具名就可能留下一条写通路。
 

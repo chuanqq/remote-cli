@@ -149,6 +149,9 @@ func searchText(r *SearchContentResult) string {
 		factIf(r.Truncated, "truncated"),
 		factIf(r.NextOffset > 0, "next_offset=%d", r.NextOffset),
 	}
+	if r.CountsComplete != nil {
+		facts = append(facts, fmt.Sprintf("counts_complete=%t", *r.CountsComplete))
+	}
 	b.WriteString(r.Pattern + " in " + r.Path + " " + header(facts...) + "\n")
 	if r.Hint != "" {
 		b.WriteString("hint: " + r.Hint + "\n")
@@ -158,7 +161,7 @@ func searchText(r *SearchContentResult) string {
 	}
 	for _, f := range r.Files {
 		if r.OutputMode == SearchCountMode {
-			fmt.Fprintf(&b, "%s:%d\n", f.File, f.Count)
+			fmt.Fprintf(&b, "%s:%d%s\n", f.File, f.Count, factIf(f.Partial, " (partial)"))
 		} else {
 			b.WriteString(f.File + "\n")
 		}
