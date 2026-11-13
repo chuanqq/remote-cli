@@ -55,6 +55,12 @@ type ServerProfile struct {
 	// CallBudgetSec is the longest one MCP tool call blocks; longer work
 	// returns an execution_id / wait_id to resume.
 	CallBudgetSec int `json:"call_budget_sec"`
+	// 只读扫描独立于命令超时，超出调用预算仍可续取。
+	DefaultScanTimeoutMs int64 `json:"default_scan_timeout_ms"`
+	MaxScanTimeoutMs     int64 `json:"max_scan_timeout_ms"`
+	MaxActiveScans       int   `json:"max_active_scans"`
+	ScanRetentionSec     int64 `json:"scan_retention_sec"`
+	MaxRetainedScans     int   `json:"max_retained_scans"`
 	// MaxWaitSec is the longest a remote_wait_for watcher may run.
 	MaxWaitSec int `json:"max_wait_sec"`
 	// DenyCommands is the effective command deny regex (jump-host blocking
@@ -124,20 +130,25 @@ func GetEnvInfo(cfg *Config) *EnvInfoResult {
 		LoadAverage:  getLoadAverage(),
 		Tools:        probeTools(probeToolList),
 		Server: ServerProfile{
-			Version:        serverVersion,
-			Commit:         gitCommit,
-			BuildTime:      buildTime,
-			ReadOnly:       cfg.ReadOnly,
-			FSRoots:        cfg.FSRoots,
-			DisabledTools:  disabled,
-			MaxTimeoutSec:  cfg.MaxTimeout,
-			MaxOutput:      cfg.MaxOutput,
-			RateLimit:      cfg.RateLimit,
-			RateBurst:      cfg.RateBurst,
-			TrustedProxies: trustedProxyStrings(cfg.TrustedProxies),
-			CallBudgetSec:  cfg.callBudgetSec(),
-			MaxWaitSec:     maxWaitTimeoutSec,
-			DenyCommands:   denyString(cfg),
+			Version:              serverVersion,
+			Commit:               gitCommit,
+			BuildTime:            buildTime,
+			ReadOnly:             cfg.ReadOnly,
+			FSRoots:              cfg.FSRoots,
+			DisabledTools:        disabled,
+			MaxTimeoutSec:        cfg.MaxTimeout,
+			MaxOutput:            cfg.MaxOutput,
+			RateLimit:            cfg.RateLimit,
+			RateBurst:            cfg.RateBurst,
+			TrustedProxies:       trustedProxyStrings(cfg.TrustedProxies),
+			CallBudgetSec:        cfg.callBudgetSec(),
+			DefaultScanTimeoutMs: defaultScanTimeout.Milliseconds(),
+			MaxScanTimeoutMs:     maxScanTimeout.Milliseconds(),
+			MaxActiveScans:       maxActiveScans,
+			ScanRetentionSec:     int64(scanRetention / time.Second),
+			MaxRetainedScans:     maxRetainedScans,
+			MaxWaitSec:           maxWaitTimeoutSec,
+			DenyCommands:         denyString(cfg),
 			Note: "This is the REMOTE host " + hostname + ": paths, working directories and commands are " +
 				"resolved here, not on the client machine.",
 		},

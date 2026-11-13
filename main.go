@@ -128,6 +128,10 @@ func gracefulShutdown(logger *slog.Logger, srv *http.Server, executor *Executor,
 	logger.Info("shutdown: signal received, draining",
 		"running_executions", executor.Running(), "grace_sec", int(grace.Seconds()))
 	endStreams()
+	scanTasks := executor.scans.List()
+	if n := executor.scans.CancelAll(); n > 0 {
+		logger.Info("shutdown: cancelled active scans", "scans", n)
+	}
 	// Watchers only observe; stopping them first also ends pending
 	// remote_wait_for calls (state=cancelled) instead of holding Shutdown.
 	if n := waits.CancelAll(); n > 0 {
@@ -137,6 +141,10 @@ func gracefulShutdown(logger *slog.Logger, srv *http.Server, executor *Executor,
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	err := srv.Shutdown(ctx)
+	// 后台读取不属于 HTTP 请求，也需在同一退出宽限内释放文件句柄。
+	for _, scan := range scanTasks {
+		scan.Await(ctx, grace)
+	}
 	// Commands that outlived their MCP call (executions.go) belong to no
 	// request, so Shutdown does not wait for them: they get the rest of the
 	// grace period as well.

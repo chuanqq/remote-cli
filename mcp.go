@@ -37,7 +37,7 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 	s := server.NewMCPServer(name, fullVersion(), opts...)
 	startTime := time.Now()
 
-	registerFileTools(s, cfg)
+	registerFileTools(s, cfg, executor.scans)
 	registerSystemTools(s, cfg)
 	registerSessionTools(s, sessions, cfg)
 	registerJobTools(s, jobs, cfg)
@@ -262,6 +262,7 @@ func serverInstructions(cfg *Config) string {
 	if cfg.DenyCommand != nil {
 		b.WriteString("Some commands are denied by server policy (see remote_get_env_info deny_commands). ")
 	}
+	b.WriteString(scanInstructions(cfg))
 	b.WriteString("remote_get_env_info returns the full profile (tools, versions, limits).")
 	return b.String()
 }
@@ -297,6 +298,7 @@ func readOnlyInstructions(cfg *Config) string {
 		"remote_read_file, remote_read_files, remote_search_content, remote_tail_log and remote_diff accept " +
 		"format=text: plain text (cat -n / grep -n style) under a one-line header with the same cursors, more " +
 		"compact than JSON. ")
+	b.WriteString(scanInstructions(cfg))
 	fmt.Fprintf(&b, "Limits: one call blocks at most %ds (remote_tail_log follow_seconds is capped to it); "+
 		"rate limit %d requests/min per client host, burst %d (HTTP 429 carries retry_after_ms).",
 		cfg.callBudgetSec(), cfg.RateLimit, cfg.RateBurst)

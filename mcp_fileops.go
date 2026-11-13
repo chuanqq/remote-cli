@@ -15,7 +15,7 @@ import (
 // registerFileTools adds file operation tools to the MCP server. All tools
 // honor cfg.FSRoots as an optional sandbox, respect the cfg tool blacklist,
 // and are audited by the withAudit tool middleware.
-func registerFileTools(s *server.MCPServer, cfg *Config) {
+func registerFileTools(s *server.MCPServer, cfg *Config, scans *ScanManager) {
 	roots := cfg.FSRoots
 
 	// auditFileOp describes a file operation for the audit record (Command
@@ -41,7 +41,9 @@ func registerFileTools(s *server.MCPServer, cfg *Config) {
 	registerEditTool(s, cfg, roots, auditFileOp)
 	registerListStatTools(s, cfg, roots, auditFileOp)
 	registerBase64Tools(s, cfg, roots, auditFileOp)
-	registerSearchTools(s, cfg, roots, auditFileOp)
+	registerSearchTools(s, cfg, roots, auditFileOp, scans)
+	registerAggregateTool(s, cfg, roots, auditFileOp, scans)
+	registerScanResultTool(s, cfg, scans)
 	registerTailLogTool(s, cfg, roots, auditFileOp)
 	registerDiffTool(s, cfg, roots, auditFileOp)
 	registerManageTools(s, cfg, roots, auditFileOp)
@@ -458,25 +460,25 @@ func registerBase64Tools(s *server.MCPServer, cfg *Config, roots []string, audit
 	}
 }
 
-// scanBudget is how long a tool that scans trees (remote_search_content,
-// remote_diff) may run: the call budget minus a margin for encoding and
-// sending the result, so a huge tree returns partial results (truncated, with
-// a hint) instead of a client-side timeout.
+// scanBudget 为编码和响应预留时间。搜索/聚合用它限制本次等待，扫描自身
+// 使用独立时限；没有续取工具时的同步扫描与 remote_diff 用它限制扫描时间。
 func scanBudget(callBudget time.Duration) time.Duration {
 	return max(callBudget-5*time.Second, callBudget*3/4)
 }
 
 // registerSearchTools adds the server-side content/file search tools.
-func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc, scans *ScanManager) {
 	if cfg.toolEnabled("remote_search_content") {
-		s.AddTool(mcp.NewTool("remote_search_content",
+		options := []mcp.ToolOption{
 			readOnlyHints(),
-			mcp.WithDescription("Search file contents on the remote server with an RE2 regex — the structured equivalent of `grep -rn pattern path`, implemented server-side (no grep/rg needed on the target). "+
-				"RE2 alternation is a bare | (GNU grep's \\| matches a literal |); fixed_strings=true searches literal text. "+
-				"output_mode: content (default: matching lines, with context_lines or before_lines/after_lines like grep -B/-A; overlapping context is emitted once), "+
-				"files_with_matches (grep -l) or count (grep -c). Globs: \"*.conf\" matches base names, \"conf/*.conf\" and \"**/*.conf\" match paths below path, \"*.{h,cpp}\" alternates. "+
-				"Files are streamed; GBK and UTF-8 are decoded per line. No matches is a success (files_matched=0), NOT an error; skipped files are counted per reason. "+
-				"When truncated, call again with offset=next_offset for the next page."),
+			mcp.WithDescription("Search file contents on the remote server with an RE2 regex — the structured equivalent of `grep -rn pattern path`, implemented server-side (no grep/rg needed on the target). " +
+				"RE2 alternation is a bare | (GNU grep's \\| matches a literal |); fixed_strings=true searches literal text. " +
+				"output_mode: content (default: matching lines, with context_lines or before_lines/after_lines like grep -B/-A; overlapping context is emitted once), " +
+				"files_with_matches (grep -l) or count (grep -c). Globs: \"*.conf\" matches base names, \"conf/*.conf\" and \"**/*.conf\" match paths below path, \"*.{h,cpp}\" alternates. " +
+				"Files are streamed; GBK and UTF-8 are decoded per line. No matches is a success (files_matched=0), NOT an error; skipped files are counted per reason. " +
+				"count 返回 total_matches 总命中行数、files_matched 总命中文件数和 files[].count 逐文件计数；明细分页不限制总数扫描，counts_complete 标记统计完整性。" +
+				"扫描可持续运行到 timeout_ms；超过本次 wait_ms 返回 state=running 和 scan_id，用 remote_scan_result 续取同一任务。" +
+				"仅在有 next_offset 时用 offset 翻页；数值字段统计用 remote_aggregate。"),
 			mcp.WithString("path", mcp.Required(), mcp.Description("File or directory to search (directories are searched recursively; a symlinked directory given as path is followed).")),
 			mcp.WithString("pattern", mcp.Required(), mcp.Description("RE2 regular expression, e.g. \"FATAL|ERROR|failed\" (or literal text with fixed_strings).")),
 			mcp.WithArray("include_glob", mcp.Description("Only search files matching any glob, e.g. [\"*.conf\", \"*.{h,cpp}\", \"conf/**/*.conf\"]."), mcp.WithStringItems()),
@@ -488,13 +490,15 @@ func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, audit
 			mcp.WithNumber("context_lines", mcp.Description("content mode: N lines before and after each match (grep -C). Default 0, max 20.")),
 			mcp.WithNumber("before_lines", mcp.Description("content mode: N lines before each match (grep -B); overrides context_lines.")),
 			mcp.WithNumber("after_lines", mcp.Description("content mode: N lines after each match (grep -A); overrides context_lines.")),
-			mcp.WithNumber("max_results", mcp.Description("Maximum results per call: matches (content) or files. Default 200, max 5000; output is also capped at 64KB. truncated=true with next_offset signals more.")),
+			mcp.WithNumber("max_results", mcp.Description("Maximum returned matches (content) or file details. Default 200, max 5000; output is also capped at 64KB. count 模式仍扫描所有文件计算总数，max_results 只限制明细。truncated=true with next_offset signals more.")),
 			mcp.WithNumber("offset", mcp.Description("Skip this many results first: pass next_offset of a truncated call (same other arguments) for the next page.")),
 			mcp.WithNumber("max_file_size", mcp.Description("Skip files larger than this many bytes. Default 256MB.")),
 			mcp.WithBoolean("include_hidden", mcp.Description("Search dot-files/dot-directories too. Default false.")),
 			mcp.WithString("encoding", mcp.Description("Force the source encoding; by default it is detected per file and per line."), mcp.Enum("utf-8", "gbk", "gb2312", "gb18030")),
 			formatOption(),
-		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		}
+		options = append(options, scanToolOptions()...)
+		s.AddTool(mcp.NewTool("remote_search_content", options...), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			path := req.GetString("path", "")
 			if path == "" {
 				return mcp.NewToolResultError("path is required"), nil
@@ -503,7 +507,7 @@ func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, audit
 				return mcp.NewToolResultError("pattern is required"), nil
 			}
 
-			result, err := SearchContent(SearchContentRequest{
+			searchReq := SearchContentRequest{
 				Path:          path,
 				Pattern:       req.GetString("pattern", ""),
 				IncludeGlob:   req.GetStringSlice("include_glob", nil),
@@ -519,17 +523,12 @@ func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, audit
 				MaxFileSize:   int64(req.GetInt("max_file_size", 0)),
 				IncludeHidden: req.GetBool("include_hidden", false),
 				Encoding:      req.GetString("encoding", ""),
-				Deadline:      time.Now().Add(scanBudget(cfg.callBudget())),
-			}, roots)
-			if err != nil {
-				auditFileOp(ctx, "search_content", path, false, 0, false)
-				return mcp.NewToolResultError(err.Error()), nil
 			}
-			auditFileOp(ctx, "search_content", path, true, result.TotalMatches, result.Truncated)
-			if textFormat(req) {
-				return textResult(searchText(result)), nil
-			}
-			return jsonResult(result), nil
+			return runReadScan(ctx, req, cfg, scans, auditFileOp, "remote_search_content", path,
+				func(scanCtx context.Context) (any, error) {
+					searchReq.Context = scanCtx
+					return SearchContent(searchReq, roots)
+				}), nil
 		})
 	}
 
