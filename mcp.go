@@ -368,6 +368,9 @@ func serverInstructions(cfg *Config) string {
 		"(remote_execution_result without execution_id lists recent executions after a lost reply). " +
 		"remote_wait_for returns state=pending with a wait_id; call again with that wait_id to keep waiting on the same server-side watcher. " +
 		"Commands that must outlive the server or run longer than the timeout_ms max go through remote_spawn. ")
+	if cfg.Mode == modeMaster {
+		b.WriteString(multiNodeInstructions(cfg))
+	}
 	if len(cfg.FSRoots) > 0 {
 		fmt.Fprintf(&b, "File tools are sandboxed to: %s. ", strings.Join(cfg.FSRoots, ", "))
 	}
@@ -411,9 +414,29 @@ func readOnlyInstructions(cfg *Config) string {
 		"format=text: plain text (cat -n / grep -n style) under a one-line header with the same cursors, more " +
 		"compact than JSON. ")
 	b.WriteString(scanInstructions(cfg))
+	if cfg.Mode == modeMaster {
+		b.WriteString(multiNodeInstructions(cfg))
+	}
 	fmt.Fprintf(&b, "Limits: one call blocks at most %ds (remote_tail_log follow_seconds is capped to it); "+
 		"rate limit %d requests/min per client host, burst %d (HTTP 429 carries retry_after_ms).",
 		cfg.callBudgetSec(), cfg.RateLimit, cfg.RateBurst)
+	return b.String()
+}
+
+// multiNodeInstructions is the master-only handshake paragraph: how to target
+// a node, how handles are scoped, and the no-fallback guarantee.
+func multiNodeInstructions(cfg *Config) string {
+	var b strings.Builder
+	if cfg.MasterLocal {
+		b.WriteString("Multi-node: this master manages slaver nodes. Pass node_id to target a node; omit it to operate on the master host itself. ")
+	} else {
+		b.WriteString("This master does not execute locally: every target tool call requires node_id. ")
+	}
+	b.WriteString("Get node_id from remote_node_list — never guess it, and never use a hostname or IP. " +
+		"A node_id that is unknown, offline or revoked fails the call; it never falls back to another node. " +
+		"Paths and commands are always resolved on the target node, not on the master. " +
+		"Long-running handles (execution_id, scan_id, wait_id, job_id, session_id) are node-scoped: pass the same node_id when you fetch or cancel them. " +
+		"Do not re-run a command whose result is unknown; query its handle instead. ")
 	return b.String()
 }
 

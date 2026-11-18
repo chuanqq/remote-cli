@@ -3,10 +3,27 @@ package main
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
+
+func TestMasterInstructionsMentionNodeRouting(t *testing.T) {
+	master := &Config{Mode: modeMaster, MasterLocal: true, MaxTimeout: 300, MaxOutput: 1 << 20, RateLimit: 120, RateBurst: 60}
+	if instr := serverInstructions(master); !strings.Contains(instr, "Multi-node") || !strings.Contains(instr, "node_id") {
+		t.Fatalf("master instructions missing multi-node guidance: %s", instr)
+	}
+	master.MasterLocal = false
+	if instr := serverInstructions(master); !strings.Contains(instr, "requires node_id") {
+		t.Fatalf("MASTER_LOCAL=off instructions missing node_id requirement: %s", instr)
+	}
+
+	standalone := &Config{MaxTimeout: 300, MaxOutput: 1 << 20, RateLimit: 120, RateBurst: 60}
+	if instr := serverInstructions(standalone); strings.Contains(instr, "Multi-node") {
+		t.Fatalf("standalone instructions must not advertise node routing: %s", instr)
+	}
+}
 
 // Node management tools take node_id as their own argument and must never be
 // treated as a routing selector (regression: remote_node_status was blocked by

@@ -51,7 +51,7 @@ master 上的 Agent 先调用 `remote_node_list` 获取 `node_id`(或 `node_name
 - 二进制主名 `agentic-remotectl`,构建时同时产出 `remote-agent-proxy` 兼容副本;PID/日志文件名保持 1.x。
 - 脚本与二进制必须同版本;旧脚本操作 2.0 二进制会明确报错。
 - 未显式配置凭据时只允许回环监听(D6);网络暴露必须配置 `REMOTECTL_TOKEN` / `_TOKEN_HASH`。
-- 控制通道当前只做集群 token 校验,TLS 可选;mTLS 证书分发为 TODO-1,控制端口只能绑定受信网络。
+- 控制通道当前为明文 gRPC,只做集群 token 校验;TLS/mTLS 证书分发为 TODO-1,控制端口只能绑定受信网络。
 - 首版只支持显式 `node_id` 路由:不支持默认节点、标签选择或批量扇出;单 master,无 HA;首版不做 drain。
 - slaver 不提供本地诊断 HTTP/MCP 端点,健康状态通过心跳和 `remote_node_status` 查看。
 - `remote_spawn` 的 job 元数据持久化在 `state/<role>/jobs/`,服务重启后可查询;execution / wait / scan 仍是进程内状态。
