@@ -8,7 +8,7 @@ import "fmt"
 // -X main.buildTime=...". They must stay package-level vars (not consts) for
 // -X to take effect.
 var (
-	serverVersion = "1.8.0"
+	serverVersion = "2.0.0"
 	gitCommit     = "unknown"
 	buildTime     = "unknown"
 )
@@ -24,7 +24,9 @@ func fullVersion() string {
 
 // versionBanner is the human-readable output of --version.
 func versionBanner() string {
-	return fmt.Sprintf("remote-agent-proxy %s (commit %s, built %s)", serverVersion, gitCommit, buildTime)
+	// The format ("name X.Y.Z (commit ..., built ...)") is a 1.x script
+	// contract; the product name changes in 2.0 (design 07 §2.1/§3.1).
+	return fmt.Sprintf("agentic-remotectl %s (commit %s, built %s)", serverVersion, gitCommit, buildTime)
 }
 
 type ExecuteRequest struct {
@@ -146,4 +148,11 @@ type AuditEntry struct {
 	State string
 	// Client is the MCP clientInfo "name/version" from the handshake.
 	Client string
+
+	// 2.0 multi-node correlation (optional, additive fields).
+	PrincipalID  string // legacy in the single-Bearer model (D12)
+	TargetNodeID string // slaver node a remote call was routed to
+	OperationID  string // master operation id, matches the slaver audit line
+	TraceID      string // end-to-end trace, currently the MCP request id
+	Route        string // local | remote
 }

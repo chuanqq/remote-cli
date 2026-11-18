@@ -11,9 +11,74 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/chuanqq/remote-cli/internal/control"
 )
 
+// localRuntime bundles everything the local execution core needs. The same
+// value feeds buildOperations for standalone/master MCP exposure and, from
+// Phase 2 on, for the slaver control adapter.
+type localRuntime struct {
+	executor  *Executor
+	sessions  *SessionManager
+	jobs      *JobManager
+	waits     *WaitManager
+	audit     *AuditLogger
+	cfg       *Config
+	startTime time.Time
+
+	// Master-only control-plane bindings. Both are nil in standalone and
+	// slaver modes, which is what keeps node tools out of those surfaces.
+	nodes     *control.NodeRegistry
+	nodeAdmin nodeAdmin
+}
+
+func newLocalRuntime(executor *Executor, sessions *SessionManager, jobs *JobManager, waits *WaitManager, audit *AuditLogger, cfg *Config) *localRuntime {
+	return &localRuntime{
+		executor:  executor,
+		sessions:  sessions,
+		jobs:      jobs,
+		waits:     waits,
+		audit:     audit,
+		cfg:       cfg,
+		startTime: time.Now(),
+	}
+}
+
+// buildOperations registers every enabled tool into a reusable OperationSet.
+// Registration order is preserved, so tools/list stays stable.
+func buildOperations(rt *localRuntime) *OperationSet {
+	ops := newOperationSet()
+	registerFileTools(ops, rt.cfg, rt.executor.scans)
+	registerSystemTools(ops, rt.cfg)
+	registerSessionTools(ops, rt.sessions, rt.cfg)
+	registerJobTools(ops, rt.jobs, rt.cfg)
+	registerWaitTool(ops, rt.executor, rt.jobs, rt.waits, rt.cfg)
+	registerExecutionResultTool(ops, rt.executor, rt.cfg)
+	registerCoreTools(ops, rt)
+	registerNodeTools(ops, rt)
+	return ops
+}
+
+// NewMCPHandler builds the standalone/master MCP surface: the local operation
+// set exposed over Streamable HTTP.
 func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManager, waits *WaitManager, audit *AuditLogger, cfg *Config) http.Handler {
+	rt := newLocalRuntime(executor, sessions, jobs, waits, audit, cfg)
+	return newMCPHandlerFromOperations(buildOperations(rt), audit, cfg)
+}
+
+// newMCPHandlerFromOperations exposes an already-built operation set over MCP.
+// Keeping this separate lets the master adapter add its own routing layer
+// without touching the handlers (Phase 3).
+func newMCPHandlerFromOperations(ops *OperationSet, audit *AuditLogger, cfg *Config) http.Handler {
+	return newMCPHandlerFromOperationsWithMiddleware(ops, audit, cfg, nil)
+}
+
+// newMCPHandlerFromOperationsWithMiddleware adds a routing/guard layer.
+// mcp-go applies middlewares in reverse registration order, so audit (added
+// first) stays outermost and still records every call, including routed ones.
+func newMCPHandlerFromOperationsWithMiddleware(ops *OperationSet, audit *AuditLogger, cfg *Config,
+	route server.ToolHandlerMiddleware) http.Handler {
 	opts := []server.ServerOption{
 		server.WithToolCapabilities(true),
 		// Every tool call is audited by one middleware (tool name, duration,
@@ -21,7 +86,10 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 		server.WithToolHandlerMiddleware(withAudit(audit)),
 		server.WithHooks(mcpMethodHooks()),
 	}
-	name := "remote-shell"
+	if route != nil {
+		opts = append(opts, server.WithToolHandlerMiddleware(route))
+	}
+	name := mcpServerName(cfg)
 	if !cfg.ReadOnly {
 		// Handshake-time limits: the agent learns them before its first call
 		// instead of from a failure (or from hand-kept notes).
@@ -31,18 +99,58 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 		// Announce the mode in the handshake so clients (and the agents driving
 		// them) know upfront that no write tool exists, instead of discovering
 		// it by a failed call.
-		name = "remote-shell-readonly"
 		opts = append(opts, server.WithInstructions(readOnlyInstructions(cfg)))
 	}
 	s := server.NewMCPServer(name, fullVersion(), opts...)
-	startTime := time.Now()
+	for _, op := range ops.List() {
+		tool := op.Tool
+		if route != nil {
+			// Master mode: every target tool advertises optional node_id.
+			tool = withMasterToolParams(tool)
+		}
+		s.AddTool(tool, op.Handler)
+	}
 
-	registerFileTools(s, cfg, executor.scans)
-	registerSystemTools(s, cfg)
-	registerSessionTools(s, sessions, cfg)
-	registerJobTools(s, jobs, cfg)
-	registerWaitTool(s, executor, jobs, waits, cfg)
-	registerExecutionResultTool(s, executor, cfg)
+	return server.NewStreamableHTTPServer(s,
+		// Inject the real peer address (and request correlation) into every
+		// MCP request context.
+		server.WithHTTPContextFunc(mcpHTTPContext),
+		// Ping the GET stream so idle middleboxes stop cutting it (~5 min in
+		// production, followed by a full re-initialize each time).
+		server.WithHeartbeatInterval(cfg.MCPHeartbeat),
+	)
+}
+
+// mcpServerName implements D20: new product names by default, the 1.8.0
+// names under REMOTECTL_MCP_SERVER_NAME=compat, or a custom value verbatim.
+func mcpServerName(cfg *Config) string {
+	switch strings.ToLower(strings.TrimSpace(cfg.MCPServerName)) {
+	case "", "new":
+		switch {
+		case cfg.ReadOnly:
+			return "agentic-remotectl-readonly"
+		case cfg.Mode == modeMaster:
+			return "agentic-remotectl-master"
+		default:
+			return "agentic-remotectl"
+		}
+	case "compat":
+		if cfg.ReadOnly {
+			return "remote-shell-readonly"
+		}
+		return "remote-shell"
+	default:
+		return cfg.MCPServerName
+	}
+}
+
+// registerCoreTools adds the command/session/cancel/status tools that used to
+// be registered inline in NewMCPHandler.
+func registerCoreTools(s toolSink, rt *localRuntime) {
+	cfg := rt.cfg
+	executor := rt.executor
+	sessions := rt.sessions
+	audit := rt.audit
 
 	budget := cfg.callBudget()
 	if !cfg.toolEnabled("remote_execution_result") {
@@ -132,6 +240,12 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 			if command == "" {
 				return mcp.NewToolResultError("command is required"), nil
 			}
+			// D18: reject concurrent calls on the same session instead of
+			// queueing them; the lock is held until the command ends.
+			if !sess.tryLockExec() {
+				return mcp.NewToolResultError("session_busy: another command is already running in this session; " +
+					"serialize calls on the same session_id"), nil
+			}
 
 			cwd := sess.Cwd()
 			execReq := ExecuteRequest{
@@ -154,9 +268,16 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 
 			ex, result := launchAndAwait(ctx, executor, audit, execReq, budget, "remote_session_execute", sessionID)
 			if result == nil {
+				// The command outlived the call: hold the session lock until it
+				// finishes so a later call cannot interleave with it.
+				go func() {
+					<-ex.Done()
+					sess.unlockExec()
+				}()
 				notePendingAudit(ctx, ex, sessionID)
 				return pendingResult(ex, budget), nil
 			}
+			sess.unlockExec()
 
 			if strings.HasPrefix(strings.TrimSpace(command), "cd ") && !strings.ContainsAny(command, "&;|><\x60()") && result.ExitCode == 0 {
 				pwdResult := executor.ExecuteInDir(ctx, sess.Shell, command+" && pwd", cwd, sess.Environment, 5000)
@@ -214,7 +335,7 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 				Version:        serverVersion,
 				Commit:         gitCommit,
 				BuildTime:      buildTime,
-				UptimeSeconds:  int64(time.Since(startTime).Seconds()),
+				UptimeSeconds:  int64(time.Since(rt.startTime).Seconds()),
 				ActiveSessions: sessions.Count(),
 				ReadOnly:       cfg.ReadOnly,
 				System: SystemInfo{
@@ -229,15 +350,6 @@ func NewMCPHandler(executor *Executor, sessions *SessionManager, jobs *JobManage
 			return jsonResult(status), nil
 		})
 	}
-
-	return server.NewStreamableHTTPServer(s,
-		// Inject the real peer address (and request correlation) into every
-		// MCP request context.
-		server.WithHTTPContextFunc(mcpHTTPContext),
-		// Ping the GET stream so idle middleboxes stop cutting it (~5 min in
-		// production, followed by a full re-initialize each time).
-		server.WithHeartbeatInterval(cfg.MCPHeartbeat),
-	)
 }
 
 // serverInstructions is the MCP handshake text (initialize.instructions):

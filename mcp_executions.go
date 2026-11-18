@@ -72,7 +72,7 @@ func pendingResult(ex *Execution, budget time.Duration) *mcp.CallToolResult {
 
 // registerExecutionResultTool adds remote_execution_result, the companion of
 // remote_execute / remote_session_execute for commands that outlive a call.
-func registerExecutionResultTool(s *server.MCPServer, executor *Executor, cfg *Config) {
+func registerExecutionResultTool(s toolSink, executor *Executor, cfg *Config) {
 	if !cfg.toolEnabled("remote_execution_result") ||
 		!(cfg.toolEnabled("remote_execute") || cfg.toolEnabled("remote_session_execute")) {
 		return

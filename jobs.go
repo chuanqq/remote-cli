@@ -55,6 +55,9 @@ type Job struct {
 	PID              int
 	LogPath          string
 	StartedAt        time.Time
+	TimeoutSeconds   int
+
+	manifestPath string
 
 	mu       sync.Mutex
 	state    JobState
@@ -63,6 +66,11 @@ type Job struct {
 	killed   bool
 	timedOut bool
 	done     chan struct{}
+	// recovered marks jobs rebuilt from a manifest after a restart. Their
+	// exit code is unknown when the process was not a child of this process.
+	recovered    bool
+	recoveryNote string
+	exitKnown    bool
 }
 
 // JobInfo is the JSON view of a job.
@@ -78,6 +86,10 @@ type JobInfo struct {
 	ElapsedMs        int64    `json:"elapsed_ms"`
 	LogPath          string   `json:"log_path"`
 	LogSize          int64    `json:"log_size"`
+	// Recovered/RecoveryNote explain state rebuilt from a manifest after a
+	// restart (D5): the exit code may be unavailable.
+	Recovered    bool   `json:"recovered,omitempty"`
+	RecoveryNote string `json:"recovery_note,omitempty"`
 }
 
 func (j *Job) info() JobInfo {
@@ -93,9 +105,13 @@ func (j *Job) info() JobInfo {
 		LogPath:          j.LogPath,
 	}
 	end := time.Now()
+	out.Recovered = j.recovered
+	out.RecoveryNote = j.recoveryNote
 	if j.state != JobRunning {
-		code := j.exitCode
-		out.ExitCode = &code
+		if j.exitKnown {
+			code := j.exitCode
+			out.ExitCode = &code
+		}
 		out.EndedAt = j.endedAt.Format(time.RFC3339Nano)
 		end = j.endedAt
 	}
@@ -124,13 +140,25 @@ type SpawnRequest struct {
 }
 
 type JobManager struct {
-	cfg  *Config
-	mu   sync.Mutex
-	jobs map[string]*Job
+	cfg         *Config
+	mu          sync.Mutex
+	jobs        map[string]*Job
+	manifestDir string
 }
 
 func NewJobManager(cfg *Config) *JobManager {
 	jm := &JobManager{cfg: cfg, jobs: make(map[string]*Job)}
+	if cfg.StateDir != "" {
+		role := cfg.Mode
+		if role == "" {
+			role = modeStandalone
+		}
+		jm.manifestDir = filepath.Join(cfg.StateDir, role, "jobs")
+	}
+	// D5: rebuild job metadata before accepting new work. Recovery never
+	// kills or deletes anything: upgrade.sh relies on detached jobs surviving
+	// a restart.
+	jm.recover()
 	go jm.sweepLoop()
 	return jm
 }
@@ -190,7 +218,9 @@ func (jm *JobManager) Spawn(req SpawnRequest) (*Job, error) {
 		PID:              cmd.Process.Pid,
 		LogPath:          logPath,
 		StartedAt:        time.Now(),
+		TimeoutSeconds:   req.TimeoutSeconds,
 		state:            JobRunning,
+		exitKnown:        true,
 		done:             make(chan struct{}),
 	}
 
@@ -230,11 +260,13 @@ func (jm *JobManager) Spawn(req SpawnRequest) (*Job, error) {
 		}
 		job.mu.Unlock()
 		close(job.done)
+		jm.persistJob(job)
 	}()
 
 	jm.mu.Lock()
 	jm.jobs[id] = job
 	jm.mu.Unlock()
+	jm.persistJob(job)
 	return job, nil
 }
 
@@ -326,6 +358,9 @@ func (jm *JobManager) sweep(now time.Time) {
 		if i >= maxFinishedJobs || now.Sub(ended) > jobRetention {
 			delete(jm.jobs, j.ID)
 			_ = os.Remove(j.LogPath)
+			if j.manifestPath != "" {
+				_ = os.Remove(j.manifestPath)
+			}
 		}
 	}
 	jm.mu.Unlock()

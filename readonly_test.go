@@ -387,8 +387,14 @@ func TestReadOnlyToolAnnotationsAndInstructions(t *testing.T) {
 	if err := json.Unmarshal(post(sid, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`).Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Result.Tools) != len(readOnlyTools) {
-		t.Errorf("listed %d tools, want the %d read-only ones", len(list.Result.Tools), len(readOnlyTools))
+	wantTools := 0
+	for name := range readOnlyTools {
+		if !slices.Contains(nodeToolNames, name) {
+			wantTools++
+		}
+	}
+	if len(list.Result.Tools) != wantTools {
+		t.Errorf("listed %d tools, want the %d read-only ones", len(list.Result.Tools), wantTools)
 	}
 	for _, tool := range list.Result.Tools {
 		a := tool.Annotations

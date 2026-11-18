@@ -16,9 +16,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-BINARY="${SCRIPT_DIR}/remote-agent-proxy"
+# Prefer the 2.0 primary binary; fall back to the 1.x compatibility copy.
+BINARY="${SCRIPT_DIR}/agentic-remotectl"
+if [[ ! -x "${BINARY}" && -x "${SCRIPT_DIR}/remote-agent-proxy" ]]; then
+    BINARY="${SCRIPT_DIR}/remote-agent-proxy"
+fi
+# PID/log names stay 1.x for upgrade-script compatibility (design 07 §3.2).
 PID_FILE="${SCRIPT_DIR}/remote-agent-proxy.pid"
 LOG_FILE="${SCRIPT_DIR}/remote-agent-proxy.log"
+
+# Script/binary must be the same release (D21).
+SCRIPT_VERSION="2.0.0"
 
 # ──────────────────────────────────────────────
 # 环境变量默认值（可通过环境变量或 env.conf 覆盖）
@@ -33,6 +41,9 @@ LOG_FILE="${SCRIPT_DIR}/remote-agent-proxy.log"
 : "${SHELL_API_FS_ROOT:=}"
 : "${SHELL_API_DISABLED_TOOLS:=}"
 : "${SHELL_API_SHUTDOWN_GRACE:=30}"
+# Token used when neither SHELL_API_TOKEN nor SHELL_API_TOKEN_HASH is configured.
+# Fixed value, no random generation.
+: "${SHELL_API_DEFAULT_TOKEN:=remote-agent-proxy-default-token}"
 
 # 加载 env.conf 文件（如果存在，且变量允许被覆盖）
 if [[ -f "${SCRIPT_DIR}/env.conf" ]]; then
@@ -43,24 +54,23 @@ if [[ -f "${SCRIPT_DIR}/env.conf" ]]; then
 fi
 
 # 空串兜底保证 set -u 下后续引用安全；未配置时由 cmd_start/cmd_foreground
-# 生成新的随机 Token。
+# 使用内置默认 Token（仅允许回环监听）。
 : "${SHELL_API_TOKEN:=}"
+
+# Effective listen/port: REMOTECTL_* wins over SHELL_API_* (matches the Go
+# config dual-read). Keep these next to the env defaults so every command
+# (start/status/mcp-prompt) reports the same values.
+EFFECTIVE_PORT="${REMOTECTL_PORT:-${SHELL_API_PORT}}"
+EFFECTIVE_LISTEN="${REMOTECTL_LISTEN:-${SHELL_API_LISTEN:-:${EFFECTIVE_PORT}}}"
+EFFECTIVE_MODE="${REMOTECTL_MODE:-standalone}"
+# Effective HTTP credential: REMOTECTL_* wins over the legacy SHELL_API_*.
+EFFECTIVE_TOKEN="${REMOTECTL_TOKEN:-${SHELL_API_TOKEN:-}}"
+EFFECTIVE_TOKEN_HASH="${REMOTECTL_TOKEN_HASH:-${SHELL_API_TOKEN_HASH:-}}"
 
 # ──────────────────────────────────────────────
 # 辅助函数
 # ──────────────────────────────────────────────
 
-# 生成随机 Token
-generate_token() {
-    # 优先用 openssl，其次用 /dev/urandom，最后用日期兜底
-    if command -v openssl &>/dev/null; then
-        openssl rand -hex 32
-    elif [[ -r /dev/urandom ]]; then
-        head -c 32 /dev/urandom | xxd -p -c 256 2>/dev/null || od -A n -t x1 -N 32 /dev/urandom | tr -d ' \n'
-    else
-        echo "auto-generated-token-$(date +%s)-$(shuf -i 10000-99999 -n 1 2>/dev/null || echo $$)"
-    fi
-}
 # 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -72,9 +82,73 @@ log_info()  { echo -e "${GREEN}[INFO]${NC}  $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
+# listen_host extracts the host part of host:port, including [::1]:port.
+listen_host() {
+    local listen="$1" host
+    if [[ "$listen" == \[*\]:* ]]; then
+        host="${listen%%]:*}"
+        host="${host#[}"
+    else
+        host="${listen%:*}"
+    fi
+    printf '%s' "${host}"
+}
+
+# is_loopback_listen is conservative: an empty host, a wildcard address and
+# any hostname other than localhost are NOT loopback. This mirrors the server
+# guard in config.go (D6).
+is_loopback_listen() {
+    local host
+    host=$(listen_host "$1" | tr '[:upper:]' '[:lower:]')
+    case "${host}" in
+        localhost) return 0 ;;
+        127.*) return 0 ;;
+        ::1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# check_binary_version refuses to launch when the script and the binary come
+# from different releases (D21).
+check_binary_version() {
+    local out version
+    out=$("${BINARY}" --version 2>/dev/null) || {
+        log_error "binary cannot run: ${BINARY} (${out})"
+        exit 1
+    }
+    version=$(printf '%s\n' "${out}" | sed -nE 's/^[^ ]+ ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+    if [[ "${version}" != "${SCRIPT_VERSION}" ]]; then
+        log_error "script/binary version mismatch: script ${SCRIPT_VERSION}, binary ${version:-unknown}"
+        echo "  upgrade every file in this directory together (binary + control.sh + env.conf)"
+        exit 1
+    fi
+}
+
+# require_secure_credential enforces D6 before launch: the built-in default
+# token is public, so it may only be used on a loopback listener.
+require_secure_credential() {
+    # A slaver has no public HTTP listener, so D6 (public default token) does
+    # not apply to it.
+    if [[ "${EFFECTIVE_MODE}" == "slaver" ]]; then
+        return 0
+    fi
+    if [[ -n "${EFFECTIVE_TOKEN}" || -n "${EFFECTIVE_TOKEN_HASH}" ]]; then
+        return 0
+    fi
+    if is_loopback_listen "${EFFECTIVE_LISTEN}"; then
+        return 0
+    fi
+    log_error "no explicit credential configured and listen address ${EFFECTIVE_LISTEN} is not loopback"
+    echo "  Set REMOTECTL_TOKEN / SHELL_API_TOKEN (or *_TOKEN_HASH), or restrict the listener:"
+    echo "  e.g. REMOTECTL_LISTEN=127.0.0.1:${EFFECTIVE_PORT} $0 start"
+    exit 1
+}
+
 # 导出服务端读取的全部环境变量
 export_env() {
     export SHELL_API_PORT
+    if [[ -n "${REMOTECTL_PORT:-}" ]]; then export REMOTECTL_PORT; fi
+    if [[ -n "${REMOTECTL_LISTEN:-}" ]]; then export REMOTECTL_LISTEN; fi
     # 鉴权二选一：导出已设置的那个（都设置时启动检查会提前报错）
     if [[ -n "${SHELL_API_TOKEN:-}" ]]; then
         export SHELL_API_TOKEN
@@ -94,7 +168,13 @@ export_env() {
     local v
     for v in SHELL_API_LOG_LEVEL SHELL_API_MCP_HEARTBEAT SHELL_API_JOB_DIR \
              SHELL_API_DENY_COMMANDS SHELL_API_BLOCK_JUMP_HOST SHELL_API_READONLY \
-             SHELL_API_CALL_BUDGET SHELL_API_TRUSTED_PROXIES; do
+             SHELL_API_CALL_BUDGET SHELL_API_TRUSTED_PROXIES \
+             REMOTECTL_MODE REMOTECTL_CONTROL_LISTEN REMOTECTL_MASTER_URL \
+             REMOTECTL_CLUSTER_TOKEN REMOTECTL_CLUSTER_TOKEN_FILE REMOTECTL_CLUSTER_TOKEN_HASH \
+             REMOTECTL_MASTER_LOCAL REMOTECTL_NODE_APPROVAL REMOTECTL_NODE_ALLOWLIST \
+             REMOTECTL_ENABLE_NODE_ADMIN_TOOLS REMOTECTL_NODE_NAME REMOTECTL_NODE_ID \
+             REMOTECTL_STATE_DIR REMOTECTL_HEARTBEAT_SEC REMOTECTL_LEASE_TTL_SEC \
+             REMOTECTL_STALE_AFTER_SEC REMOTECTL_OFFLINE_AFTER_SEC; do
         if [[ -n "${!v:-}" ]]; then export "${v?}"; fi
     done
     # 不设置 TLS 相关变量，确保使用 HTTP
@@ -134,8 +214,8 @@ cmd_version() {
 # ──────────────────────────────────────────────
 cmd_start() {
     # 鉴权互斥检查：服务端会 fatal，这里提前报错提示更友好
-    if [[ -n "${SHELL_API_TOKEN:-}" && -n "${SHELL_API_TOKEN_HASH}" ]]; then
-        log_error "SHELL_API_TOKEN 与 SHELL_API_TOKEN_HASH 互斥，只能设置其中一个"
+    if [[ -n "${EFFECTIVE_TOKEN}" && -n "${EFFECTIVE_TOKEN_HASH}" ]]; then
+        log_error "token 与 token hash 互斥（REMOTECTL_TOKEN/REMOTECTL_TOKEN_HASH 或对应 SHELL_API_*），只能设置其中一个"
         exit 1
     fi
 
@@ -157,14 +237,17 @@ cmd_start() {
         log_info "二进制文件不存在，自动编译..."
         cmd_build
     fi
+    check_binary_version
 
-    # 自动生成 Token（如果 Token 与 Token Hash 都未设置；哈希模式无法自动
-    # 生成——明文必须由用户持有并配置到客户端）
-    if [[ -z "${SHELL_API_TOKEN}" && -z "${SHELL_API_TOKEN_HASH}" ]]; then
-        SHELL_API_TOKEN=$(generate_token)
-        log_warn "未设置 SHELL_API_TOKEN / SHELL_API_TOKEN_HASH，已自动生成随机 Token"
-        echo "  Token: ${SHELL_API_TOKEN}"
-        echo "  请保存此 Token，下次启动时可通过环境变量或 env.conf 文件指定"
+    # D6: refuse a public listener without an explicit credential.
+    require_secure_credential
+
+    # No random generation: fall back to the fixed default token when the
+    # operator configured neither a token nor a token hash.
+    if [[ -z "${EFFECTIVE_TOKEN}" && -z "${EFFECTIVE_TOKEN_HASH}" ]]; then
+        SHELL_API_TOKEN="${SHELL_API_DEFAULT_TOKEN}"
+        log_warn "No explicit credential configured; using the built-in default token (loopback listeners only)"
+        echo "  Configure SHELL_API_TOKEN / REMOTECTL_TOKEN (or *_TOKEN_HASH) in env.conf for network exposure"
     fi
 
     export_env
@@ -174,8 +257,15 @@ cmd_start() {
     log_info "Remote Shell API Server 启动中..."
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  版本:      $("${BINARY}" --version 2>/dev/null || echo unknown)"
-    echo "  端口:      ${SHELL_API_PORT}"
-    echo "  协议:      HTTP（明文，未启用 TLS）"
+    echo "  模式:      ${EFFECTIVE_MODE}"
+    if [[ "${EFFECTIVE_MODE}" == "slaver" ]]; then
+        echo "  主节点:    ${REMOTECTL_MASTER_URL:-<unset>}"
+        echo "  监听:      无公共 HTTP 端口（仅出站控制连接）"
+    else
+        echo "  监听:      ${EFFECTIVE_LISTEN}"
+        echo "  端口:      ${EFFECTIVE_PORT}"
+        echo "  协议:      HTTP（明文，未启用 TLS）"
+    fi
     if [[ -n "${SHELL_API_TOKEN_HASH}" ]]; then
         echo -e "  鉴权:      ${CYAN}哈希模式（盐化 SHA-256，服务端不存明文 Token）${NC}"
     else
@@ -206,10 +296,14 @@ cmd_start() {
     if kill -0 "${pid}" 2>/dev/null; then
         log_info "服务启动成功 (PID: ${pid})"
         echo ""
-        echo -e "${CYAN}快速验证:${NC}"
-        echo "  MCP 端点: http://localhost:${SHELL_API_PORT}/mcp"
-        echo ""
-        echo "  使用 MCP 客户端连接并调用工具"
+        if [[ "${EFFECTIVE_MODE}" == "slaver" ]]; then
+            echo "  查看注册结果: grep 'registered with master' ${LOG_FILE}"
+        else
+            echo -e "${CYAN}快速验证:${NC}"
+            echo "  MCP 端点: http://localhost:${EFFECTIVE_PORT}/mcp"
+            echo ""
+            echo "  使用 MCP 客户端连接并调用工具"
+        fi
     else
         log_error "服务启动失败，请查看日志: ${LOG_FILE}"
         rm -f "${PID_FILE}"
@@ -285,16 +379,33 @@ cmd_status() {
 
     echo -e "${GREEN}状态: 运行中${NC}"
     echo "  PID:       ${pid}"
+    echo "  模式:      ${EFFECTIVE_MODE}"
+
+    if [[ "${EFFECTIVE_MODE}" == "slaver" ]]; then
+        if grep -q 'registered with master' "${LOG_FILE}" 2>/dev/null; then
+            echo "  控制连接:  已注册（见日志中的 registered with master）"
+        else
+            echo "  控制连接:  未注册成功，请查看日志: ${LOG_FILE}"
+        fi
+        echo "  日志:      ${LOG_FILE}"
+        return 0
+    fi
 
     # 实际监听端口。lsof 的 -p 与 -i 默认取并集，必须加 -a 取交集，否则会
-    # 列出机器上所有监听进程（-P -n 禁用服务名/主机名解析）。探测不到时
-    # 回退到配置值，MCP 端点检查也用它。
-    local port=""
+    # 列出机器上所有监听进程（-P -n 禁用服务名/主机名解析）。
+    # A master listens on both the MCP port and the control port, so prefer
+    # the configured MCP port; never report the gRPC control port as MCP.
+    local ports="" port=""
     if command -v lsof &>/dev/null; then
-        port=$(lsof -a -P -n -p "${pid}" -i TCP -s TCP:LISTEN -Fn 2>/dev/null \
-               | sed -nE 's/^n.*:([0-9]+)$/\1/p' | head -1 || true)
+        ports=$(lsof -a -P -n -p "${pid}" -i TCP -s TCP:LISTEN -Fn 2>/dev/null \
+                | sed -nE 's/^n.*:([0-9]+)$/\1/p' | sort -u || true)
     fi
-    [[ -n "${port}" ]] || port="${SHELL_API_PORT:-unknown}"
+    if [[ -n "${ports}" ]] && printf '%s\n' "${ports}" | grep -qx "${EFFECTIVE_PORT}"; then
+        port="${EFFECTIVE_PORT}"
+    elif [[ -n "${ports}" ]]; then
+        port=$(printf '%s\n' "${ports}" | head -1)
+    fi
+    [[ -n "${port}" ]] || port="${EFFECTIVE_PORT:-unknown}"
     echo "  端口:      ${port}"
 
     # MCP 端点探测（未携带凭据时应返回 401，说明服务已接受连接）
@@ -316,8 +427,8 @@ cmd_status() {
 # ──────────────────────────────────────────────
 cmd_foreground() {
     # 鉴权互斥检查（与 cmd_start 一致）
-    if [[ -n "${SHELL_API_TOKEN:-}" && -n "${SHELL_API_TOKEN_HASH}" ]]; then
-        log_error "SHELL_API_TOKEN 与 SHELL_API_TOKEN_HASH 互斥，只能设置其中一个"
+    if [[ -n "${EFFECTIVE_TOKEN}" && -n "${EFFECTIVE_TOKEN_HASH}" ]]; then
+        log_error "token 与 token hash 互斥（REMOTECTL_TOKEN/REMOTECTL_TOKEN_HASH 或对应 SHELL_API_*），只能设置其中一个"
         exit 1
     fi
 
@@ -326,11 +437,15 @@ cmd_foreground() {
         log_info "二进制文件不存在，自动编译..."
         cmd_build
     fi
+    check_binary_version
 
-    # 自动生成 Token（两者都未设置时；哈希模式无法自动生成）
-    if [[ -z "${SHELL_API_TOKEN}" && -z "${SHELL_API_TOKEN_HASH}" ]]; then
-        SHELL_API_TOKEN=$(generate_token)
-        log_warn "未设置 SHELL_API_TOKEN / SHELL_API_TOKEN_HASH，已自动生成随机 Token: ${SHELL_API_TOKEN}"
+    # D6: same guard as cmd_start.
+    require_secure_credential
+
+    # No random generation: fall back to the fixed default token.
+    if [[ -z "${EFFECTIVE_TOKEN}" && -z "${EFFECTIVE_TOKEN_HASH}" ]]; then
+        SHELL_API_TOKEN="${SHELL_API_DEFAULT_TOKEN}"
+        log_warn "No explicit credential configured; using the built-in default token (loopback listeners only)"
     fi
 
     export_env
@@ -350,10 +465,18 @@ json_quote() {
 }
 
 cmd_mcp_prompt() {
+    if [[ "${EFFECTIVE_MODE}" == "slaver" ]]; then
+        log_error "slaver mode has no public MCP endpoint; connect clients to the master instead"
+        return 1
+    fi
     local url="${1:-${MCP_PUBLIC_URL:-}}"
     local name="${2:-${MCP_SERVER_NAME:-remote-shell}}"
-    local token="${CHECK_TOKEN:-${SHELL_API_TOKEN:-}}"
+    local token="${CHECK_TOKEN:-${EFFECTIVE_TOKEN}}"
     local auth="Bearer <CLIENT_TOKEN>" authority
+    # D6: never emit the public built-in default token as if it were a secret.
+    if [[ -z "${CHECK_TOKEN:-}" && "${token}" == "${SHELL_API_DEFAULT_TOKEN}" ]]; then
+        token=""
+    fi
     if [[ $# -gt 2 || -z "$url" ]]; then
         log_error "用法: $0 mcp-prompt <客户端可达的 MCP URL> [服务名]，或配置 MCP_PUBLIC_URL"
         return 1
@@ -392,21 +515,78 @@ cmd_mcp_prompt() {
 # 命令: token  显示当前 Token
 # ──────────────────────────────────────────────
 cmd_token() {
-    if [[ -n "${SHELL_API_TOKEN}" ]]; then
-        echo "当前 Token: ${SHELL_API_TOKEN}"
+    if [[ -n "${EFFECTIVE_TOKEN}" ]]; then
+        echo "当前 Token: ${EFFECTIVE_TOKEN}"
         return 0
     fi
-    if [[ -n "${SHELL_API_TOKEN_HASH}" ]]; then
+    if [[ -n "${EFFECTIVE_TOKEN_HASH}" ]]; then
         echo "当前为哈希模式（服务端只存盐化 SHA-256，无明文可显示）"
-        echo "  Token Hash: ${SHELL_API_TOKEN_HASH}"
+        echo "  Token Hash: ${EFFECTIVE_TOKEN_HASH}"
         echo "  明文 Token 仅客户端持有；重置时生成新哈希更新 SHELL_API_TOKEN_HASH 即可"
         return 0
     fi
-    log_error "SHELL_API_TOKEN / SHELL_API_TOKEN_HASH 均未设置"
-    echo "  请设置环境变量: export SHELL_API_TOKEN=your-token"
-    echo "  或在 env.conf 文件中添加: SHELL_API_TOKEN=your-token"
-    echo "  或使用哈希模式: printf '%s' 'your-token' | ${BINARY} hash-token"
+    echo "No explicit credential configured; the server will use the built-in default token (loopback listeners only):"
+    echo "  Token: ${SHELL_API_DEFAULT_TOKEN}"
+    echo "  Set SHELL_API_TOKEN / REMOTECTL_TOKEN or *_TOKEN_HASH in env.conf for network exposure."
+    echo "  Generate a hash: printf '%s' 'your-token' | ${BINARY} hash-token"
     exit 1
+}
+
+# ──────────────────────────────────────────────
+# 命令: mode  显示运行模式与关键配置
+# ──────────────────────────────────────────────
+cmd_mode() {
+    echo "mode: ${EFFECTIVE_MODE}"
+    echo "state_dir: ${REMOTECTL_STATE_DIR:-${SCRIPT_DIR}/state}"
+    case "${EFFECTIVE_MODE}" in
+        standalone)
+            ;;
+        master)
+            echo "control_listen: ${REMOTECTL_CONTROL_LISTEN:-<unset, master refuses to start>}"
+            echo "approval: ${REMOTECTL_NODE_APPROVAL:-manual}"
+            echo "master_local: ${REMOTECTL_MASTER_LOCAL:-on}"
+            echo "node_admin_tools: ${REMOTECTL_ENABLE_NODE_ADMIN_TOOLS:-false}"
+            ;;
+        slaver)
+            echo "master_url: ${REMOTECTL_MASTER_URL:-<unset, slaver refuses to start>}"
+            echo "node_name: ${REMOTECTL_NODE_NAME:-<hostname>}"
+            echo "node_id_override: ${REMOTECTL_NODE_ID:-<from state dir>}"
+            ;;
+        *)
+            log_error "invalid REMOTECTL_MODE: ${EFFECTIVE_MODE}"
+            exit 1
+            ;;
+    esac
+}
+
+# ──────────────────────────────────────────────
+# 命令: node  显示本机节点身份与状态文件位置
+# ──────────────────────────────────────────────
+cmd_node() {
+    local state="${REMOTECTL_STATE_DIR:-${SCRIPT_DIR}/state}"
+    echo "mode: ${EFFECTIVE_MODE}"
+    if [[ -f "${state}/slaver/node-id" ]]; then
+        echo "node_id: $(cat "${state}/slaver/node-id")"
+    fi
+    if [[ -f "${state}/master/nodes.json" ]]; then
+        echo "nodes_file: ${state}/master/nodes.json"
+    fi
+    echo "提示: 节点列表/状态请通过 master 的 remote_node_list / remote_node_status 查看"
+}
+
+# ──────────────────────────────────────────────
+# 命令: cluster-token  转发给二进制的集群 token CLI
+# ──────────────────────────────────────────────
+cmd_cluster_token() {
+    if [[ ! -f "${BINARY}" ]]; then
+        log_info "二进制文件不存在，自动编译..."
+        cmd_build
+    fi
+    check_binary_version
+    if [[ -z "${REMOTECTL_STATE_DIR:-}" ]]; then
+        export REMOTECTL_STATE_DIR="${SCRIPT_DIR}/state"
+    fi
+    exec "${BINARY}" cluster-token "$@"
 }
 
 # ──────────────────────────────────────────────
@@ -440,8 +620,17 @@ case "${1:-}" in
     mcp-prompt)
         cmd_mcp_prompt "${@:2}"
         ;;
+    mode)
+        cmd_mode
+        ;;
+    node)
+        cmd_node
+        ;;
+    cluster-token|cluster_token)
+        cmd_cluster_token "${@:2}"
+        ;;
     help|--help|-h)
-        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|mcp-prompt|help}"
+        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|mcp-prompt|mode|node|cluster-token|help}"
         echo ""
         echo "  start       后台启动服务"
         echo "  stop        优雅停止服务（SIGTERM，超时后 kill -9）"
@@ -452,11 +641,17 @@ case "${1:-}" in
         echo "  version     显示二进制版本"
         echo "  token       显示当前 Token"
         echo "  mcp-prompt [URL] [服务名]  输出可复制到 agent 终端的 MCP 添加指令"
+        echo "  mode        显示 standalone/master/slaver 模式与关键配置"
+        echo "  node        显示本机 node_id 与状态文件位置"
+        echo "  cluster-token <create|rotate|finish>  集群 token 生命周期管理"
         echo "  help        显示此帮助"
         echo ""
         echo "环境变量（可在脚本内或 env.conf 文件中设置）:"
         echo "  SHELL_API_PORT            监听端口（默认: 8099）"
-        echo "  SHELL_API_TOKEN           Bearer Token（必填，未设置时会自动生成）"
+        echo "  REMOTECTL_PORT            Listen port (takes precedence over SHELL_API_PORT; default: 8099)"
+        echo "  REMOTECTL_LISTEN          Full listen address host:port (default: :port); a non-loopback"
+        echo "                            listener requires an explicit token or token hash"
+        echo "  SHELL_API_TOKEN           Bearer Token（未设置时使用内置默认 Token，仅限回环监听）"
         echo "  SHELL_API_TOKEN_HASH      Token 的盐化 SHA-256（sha256:盐:哈希），与 SHELL_API_TOKEN 二选一，"
         echo "                            服务端不落明文。生成: printf '%s' 'your-token' | ${BINARY} hash-token"
         echo "  SHELL_API_MAX_TIMEOUT     命令超时上限秒数（默认: 900）"
@@ -476,6 +671,13 @@ case "${1:-}" in
         echo "  SHELL_API_BLOCK_JUMP_HOST 设为 true 拦截 ssh/gssh/scp/sftp/sshpass 跳板命令（默认: 关闭）"
         echo "  SHELL_API_DENY_COMMANDS   自定义命令拦截 RE2 正则（默认: 空）"
         echo ""
+        echo "2.0 集群模式（env.conf）:"
+        echo "  REMOTECTL_MODE=standalone|master|slaver （默认: standalone）"
+        echo "  master: REMOTECTL_CONTROL_LISTEN=host:port（必填）、REMOTECTL_CLUSTER_TOKEN_HASH"
+        echo "          REMOTECTL_NODE_APPROVAL=auto|manual|allowlist、REMOTECTL_MASTER_LOCAL=on|off"
+        echo "  slaver: REMOTECTL_MASTER_URL=host:port（必填）、REMOTECTL_CLUSTER_TOKEN 或 _FILE"
+        echo "  REMOTECTL_STATE_DIR        状态目录（默认: 部署目录/state）"
+        echo ""
         echo "mcp-prompt 专用参数（不改变服务端配置）:"
         echo "  MCP_PUBLIC_URL   客户端可达的完整 MCP URL，可由命令参数覆盖"
         echo "  MCP_SERVER_NAME  客户端中的服务名（默认: remote-shell）"
@@ -484,7 +686,7 @@ case "${1:-}" in
         ;;
     *)
         echo "未知命令: ${1:-}"
-        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|mcp-prompt|help}"
+        echo "用法: $0 {start|stop|restart|status|foreground|build|version|token|mcp-prompt|mode|node|cluster-token|help}"
         exit 1
         ;;
 esac

@@ -12,6 +12,51 @@
 
 > **说明**:自 v1.6.0 起服务只保留 MCP Streamable HTTP 入口,早期版本的 REST 兼容接口已移除;客户端请统一使用 MCP。
 
+## v2.0.0 多节点(master / slaver)
+
+2.0 在保留 1.8.0 单机行为的前提下增加集群控制面:一个 master 通过单一 MCP 端点管理多台 slaver,工具名和既有参数保持不变,目标类工具统一增加可选 `node_id`。
+
+| 模式 | 公共 `/mcp` | 工具 | 本机执行 | 说明 |
+| --- | --- | --- | --- | --- |
+| `standalone`(默认) | 有 | 1.8.0 全部工具 | 有 | 不配置新参数时与 1.8.0 行为一致 |
+| `master` | 有 | 1.8.0 工具 + `remote_node_*` | 默认有,可关 | 唯一对外 MCP 入口;控制面 + 路由 |
+| `slaver` | **无** | 不对外暴露 | 有 | 主动连接 master,只接受控制命令 |
+
+快速开始:
+
+```bash
+# 1. 生成预共享集群 token(master 只保存哈希,明文只在此刻显示)
+./agentic-remotectl cluster-token create
+
+# 2. master:参考 deploy/env.master.conf.example
+REMOTECTL_MODE=master \
+REMOTECTL_CONTROL_LISTEN=0.0.0.0:9443 \
+REMOTECTL_TOKEN=client-bearer-token \
+REMOTECTL_CLUSTER_TOKEN_HASH='sha256:<salt>:<hash>' \
+REMOTECTL_NODE_APPROVAL=manual \
+./agentic-remotectl
+
+# 3. slaver:参考 deploy/env.slaver.conf.example
+REMOTECTL_MODE=slaver \
+REMOTECTL_MASTER_URL=master.example.com:9443 \
+REMOTECTL_CLUSTER_TOKEN='rct_...' \
+REMOTECTL_NODE_NAME=prod-db-01 \
+./agentic-remotectl
+```
+
+master 上的 Agent 先调用 `remote_node_list` 获取 `node_id`(或 `node_name`),再在任意目标类工具中传入;长任务句柄(`execution_id` / `scan_id` / `wait_id` / `job_id` / `session_id`)按节点作用域,续取时带同一个 `node_id`。manual 审批模式下,需要用管理模板开启 `REMOTECTL_ENABLE_NODE_ADMIN_TOOLS=true` 后调用 `remote_node_approve`,或使用 `auto` / `allowlist` 审批。
+
+兼容与限制:
+
+- 二进制主名 `agentic-remotectl`,构建时同时产出 `remote-agent-proxy` 兼容副本;PID/日志文件名保持 1.x。
+- 脚本与二进制必须同版本;旧脚本操作 2.0 二进制会明确报错。
+- 未显式配置凭据时只允许回环监听(D6);网络暴露必须配置 `REMOTECTL_TOKEN` / `_TOKEN_HASH`。
+- 控制通道当前只做集群 token 校验,TLS 可选;mTLS 证书分发为 TODO-1,控制端口只能绑定受信网络。
+- 首版只支持显式 `node_id` 路由:不支持默认节点、标签选择或批量扇出;单 master,无 HA;首版不做 drain。
+- slaver 不提供本地诊断 HTTP/MCP 端点,健康状态通过心跳和 `remote_node_status` 查看。
+- `remote_spawn` 的 job 元数据持久化在 `state/<role>/jobs/`,服务重启后可查询;execution / wait / scan 仍是进程内状态。
+- 升级顺序:先 master,再逐台 slaver;`upgrade.sh` 在停止旧服务后迁移 `state/`,slaver 以日志中的 `registered with master` 判定就绪。
+
 ## 特性
 
 - **命令执行**:可取消、可续取结果的执行,基于进程组的硬超时控制,有界输出捕获可选保留头部或尾部(`truncate_mode`),可选 GBK 等输出解码(`output_encoding`)
@@ -42,16 +87,16 @@ go install github.com/chuanqq/remote-cli@latest
 # 方式二:源码构建
 git clone https://github.com/chuanqq/remote-cli.git
 cd remote-cli
-go build -o remote-agent-proxy
+go build -o agentic-remotectl .
 
 # 运行(最低要求:设置 Token)
-SHELL_API_TOKEN=your-secret-token ./remote-agent-proxy
+SHELL_API_TOKEN=your-secret-token ./agentic-remotectl
 
 # 哈希模式(服务端不落明文 Token):客户端照旧发送明文 Bearer,
 # 服务端只存盐化 SHA-256,两者与 SHELL_API_TOKEN 二选一
-printf '%s' 'your-secret-token' | ./remote-agent-proxy hash-token
+printf '%s' 'your-secret-token' | ./agentic-remotectl hash-token
 # 输出形如 sha256:<salt-hex>:<hash-hex>,写入:
-SHELL_API_TOKEN_HASH=sha256:...:... ./remote-agent-proxy
+SHELL_API_TOKEN_HASH=sha256:...:... ./agentic-remotectl
 
 # 只读模式(一键):仅暴露读取能力,禁止任何修改
 SHELL_API_TOKEN=your-secret-token SHELL_API_READONLY=true ./remote-agent-proxy
@@ -62,7 +107,7 @@ SHELL_API_TOKEN=your-secret-token SHELL_API_READONLY=true ./remote-agent-proxy
 SHELL_API_TOKEN=your-secret-token \
 SHELL_API_TLS_CERT=./cert.pem \
 SHELL_API_TLS_KEY=./key.pem \
-./remote-agent-proxy
+./agentic-remotectl
 ```
 
 接入 Claude Code:
@@ -85,7 +130,7 @@ claude mcp add --transport http remote-shell https://your-host:8080/mcp \
 }
 ```
 
-连通后客户端 `tools/list` 应能看到全部 35 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 34 个)。服务端只提供上述 MCP 端点,不存在独立的 REST HTTP 接口。
+连通后客户端 `tools/list` 应能看到全部 35 个工具(未设置 `SHELL_API_FS_ROOT` 时 `remote_delete_file` 不注册,为 34 个)。`master` 模式在此基础上额外注册 5 个 `remote_node_*` 工具；只读模式注册 15 个只读工具(master 还包含 `remote_node_list` / `remote_node_status`)。服务端只提供上述 MCP 端点,不存在独立的 REST HTTP 接口。
 
 ## v1.8.0 升级说明
 

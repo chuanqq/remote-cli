@@ -9,13 +9,12 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 // registerFileTools adds file operation tools to the MCP server. All tools
 // honor cfg.FSRoots as an optional sandbox, respect the cfg tool blacklist,
 // and are audited by the withAudit tool middleware.
-func registerFileTools(s *server.MCPServer, cfg *Config, scans *ScanManager) {
+func registerFileTools(s toolSink, cfg *Config, scans *ScanManager) {
 	roots := cfg.FSRoots
 
 	// auditFileOp describes a file operation for the audit record (Command
@@ -51,7 +50,7 @@ func registerFileTools(s *server.MCPServer, cfg *Config, scans *ScanManager) {
 
 type fileAuditFunc func(ctx context.Context, op, path string, ok bool, bytes int, truncated bool)
 
-func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerWriteTool(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if !cfg.toolEnabled("remote_write_file") {
 		return
 	}
@@ -96,7 +95,7 @@ func registerWriteTool(s *server.MCPServer, cfg *Config, roots []string, auditFi
 	})
 }
 
-func registerReadTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerReadTool(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if !cfg.toolEnabled("remote_read_file") {
 		return
 	}
@@ -160,7 +159,7 @@ type readFilesSpec struct {
 	Encoding    string `json:"encoding"`
 }
 
-func registerReadFilesTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerReadFilesTool(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if !cfg.toolEnabled("remote_read_files") {
 		return
 	}
@@ -253,7 +252,7 @@ func readFilesAuditPaths(r *ReadFilesResult) string {
 	return b.String()
 }
 
-func registerEditTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerEditTool(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if !cfg.toolEnabled("remote_edit_file") {
 		return
 	}
@@ -318,7 +317,7 @@ func registerEditTool(s *server.MCPServer, cfg *Config, roots []string, auditFil
 	})
 }
 
-func registerListStatTools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerListStatTools(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if cfg.toolEnabled("remote_list_dir") {
 		s.AddTool(mcp.NewTool("remote_list_dir",
 			readOnlyHints(),
@@ -397,7 +396,7 @@ func registerListStatTools(s *server.MCPServer, cfg *Config, roots []string, aud
 	}
 }
 
-func registerBase64Tools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerBase64Tools(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if cfg.toolEnabled("remote_upload_base64") {
 		s.AddTool(mcp.NewTool("remote_upload_base64",
 			mcp.WithDescription("Upload binary content to a remote file by decoding a base64 payload. Supports append mode for chunked uploads of large files and auto-creating parent directories. Returns sha256/mode of the written bytes for verification."),
@@ -467,7 +466,7 @@ func scanBudget(callBudget time.Duration) time.Duration {
 }
 
 // registerSearchTools adds the server-side content/file search tools.
-func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc, scans *ScanManager) {
+func registerSearchTools(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc, scans *ScanManager) {
 	if cfg.toolEnabled("remote_search_content") {
 		options := []mcp.ToolOption{
 			readOnlyHints(),
@@ -584,7 +583,7 @@ func registerSearchTools(s *server.MCPServer, cfg *Config, roots []string, audit
 
 // registerDiffTool adds remote_diff: file-to-file unified diff, or a
 // directory-tree comparison (added / removed / changed).
-func registerDiffTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerDiffTool(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if !cfg.toolEnabled("remote_diff") {
 		return
 	}
@@ -630,7 +629,7 @@ func registerDiffTool(s *server.MCPServer, cfg *Config, roots []string, auditFil
 }
 
 // registerTailLogTool adds the log-viewing tool (tail/cursor/follow/filter).
-func registerTailLogTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerTailLogTool(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if !cfg.toolEnabled("remote_tail_log") {
 		return
 	}
@@ -682,7 +681,7 @@ func registerTailLogTool(s *server.MCPServer, cfg *Config, roots []string, audit
 // only registered when FSRoots is non-empty: deleting with an unbounded
 // filesystem is considered too dangerous (disable it explicitly via
 // SHELL_API_DISABLED_TOOLS otherwise).
-func registerManageTools(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
+func registerManageTools(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc) {
 	if cfg.toolEnabled("remote_move_file") {
 		s.AddTool(mcp.NewTool("remote_move_file",
 			mcp.WithDescription("Move/rename a file or directory on the remote server (cross-filesystem moves fall back to copy+remove). Both paths must stay inside the FS roots."),

@@ -116,6 +116,17 @@ func buildTokenAuth(token, tokenHash string) (*tokenAuth, string, error) {
 	}
 }
 
+// verifyTokenHash checks a presented plaintext token against a
+// "sha256:<salt>:<hash>" spec in constant time. It is used by the master to
+// validate the pre-shared cluster token at registration.
+func verifyTokenHash(spec, token string) bool {
+	salt, want, err := parseTokenHash(spec)
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(hashToken(salt, token), want) == 1
+}
+
 func AuthMiddleware(auth *tokenAuth, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authz := r.Header.Get("Authorization")

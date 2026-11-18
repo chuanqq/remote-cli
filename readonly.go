@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -56,6 +55,9 @@ var readOnlyTools = map[string]bool{
 	"remote_check_port":     true,
 	"remote_get_env_info":   true,
 	"remote_status":         true,
+	// Node introspection (master only; harmless when no registry exists)
+	"remote_node_list":   true,
+	"remote_node_status": true,
 }
 
 // readOnlyEnabled is the process-wide latch consulted by the layer-2 operation
@@ -142,6 +144,22 @@ var allToolNames = []string{
 	"remote_job_kill",
 	"remote_wait_for",
 	"remote_execution_result",
+	// Node management (master only; registered when a control plane exists)
+	"remote_node_list",
+	"remote_node_status",
+	"remote_node_approve",
+	"remote_node_revoke",
+	"remote_node_forget",
+}
+
+// nodeToolNames is the master-only node management surface. Standalone never
+// registers these, so inventory tests subtract them.
+var nodeToolNames = []string{
+	"remote_node_list",
+	"remote_node_status",
+	"remote_node_approve",
+	"remote_node_revoke",
+	"remote_node_forget",
 }
 
 // parseReadOnly interprets the SHELL_API_READONLY value. Accepted truthy forms:
@@ -153,11 +171,6 @@ func parseReadOnly(v string) bool {
 	default:
 		return false
 	}
-}
-
-// readOnlyFromEnv reads the switch from the environment.
-func readOnlyFromEnv() bool {
-	return parseReadOnly(os.Getenv("SHELL_API_READONLY"))
 }
 
 // sortedReadOnlyToolNames lists the allowed tools, sorted, for startup logging.

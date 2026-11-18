@@ -5,13 +5,12 @@ import (
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 // registerSystemTools adds host-introspection tools (processes, ports,
 // environment profile) to the MCP server. These read system state only and
 // are NOT sandboxed by FSRoots (they touch no file contents).
-func registerSystemTools(s *server.MCPServer, cfg *Config) {
+func registerSystemTools(s toolSink, cfg *Config) {
 	// auditCall describes the call for the withAudit middleware, which adds
 	// the registered tool name, timing and the failure reason.
 	auditCall := func(ctx context.Context, descriptor string) {
@@ -72,7 +71,7 @@ func registerSystemTools(s *server.MCPServer, cfg *Config) {
 
 // registerSessionTools adds the session lifecycle tools so MCP clients can
 // create/list/close persistent sessions through MCP.
-func registerSessionTools(s *server.MCPServer, sessions *SessionManager, cfg *Config) {
+func registerSessionTools(s toolSink, sessions *SessionManager, cfg *Config) {
 	auditCall := func(ctx context.Context, sessionID, descriptor string) {
 		noteAudit(ctx, func(n *auditNote) { n.Command = descriptor; n.SessionID = sessionID })
 	}

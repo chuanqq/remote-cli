@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 // 参数使用整数类型解码，避免将 1.5 这样的列号静默截断到第一列。
@@ -28,7 +27,7 @@ type aggregateToolArgs struct {
 	Filters        []AggregateFilter `json:"filters"`
 }
 
-func registerAggregateTool(s *server.MCPServer, cfg *Config, roots []string, auditFileOp fileAuditFunc, scans *ScanManager) {
+func registerAggregateTool(s toolSink, cfg *Config, roots []string, auditFileOp fileAuditFunc, scans *ScanManager) {
 	if !cfg.toolEnabled("remote_aggregate") {
 		return
 	}

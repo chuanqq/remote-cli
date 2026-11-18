@@ -68,6 +68,11 @@ type auditNote struct {
 	TimedOut         bool
 	Error            string
 	State            string
+	// Multi-node correlation (2.0).
+	TargetNodeID string
+	OperationID  string
+	TraceID      string
+	Route        string
 }
 
 type auditNoteKey struct{}
@@ -113,6 +118,17 @@ func withAudit(audit *AuditLogger) server.ToolHandlerMiddleware {
 				TimedOut:         note.TimedOut,
 				Error:            note.Error,
 				State:            note.State,
+				PrincipalID:      "legacy", // D12: single-Bearer model
+				TargetNodeID:     note.TargetNodeID,
+				OperationID:      note.OperationID,
+				TraceID:          note.TraceID,
+				Route:            note.Route,
+			}
+			if entry.TraceID == "" {
+				entry.TraceID = entry.ReqID
+			}
+			if entry.Route == "" {
+				entry.Route = "local"
 			}
 			if cs := server.ClientSessionFromContext(ctx); cs != nil {
 				entry.MCPSession = cs.SessionID()

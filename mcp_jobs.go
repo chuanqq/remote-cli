@@ -6,13 +6,12 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 // registerJobTools adds the background-job tools: remote_spawn starts a
 // detached job and returns at once; remote_job_status / remote_job_list /
 // remote_job_logs / remote_job_kill operate on it by job id.
-func registerJobTools(s *server.MCPServer, jobs *JobManager, cfg *Config) {
+func registerJobTools(s toolSink, jobs *JobManager, cfg *Config) {
 	if cfg.toolEnabled("remote_spawn") {
 		s.AddTool(mcp.NewTool("remote_spawn",
 			mcp.WithDescription(fmt.Sprintf("Start a command as a detached background job and return immediately with a job_id. Use this instead of `nohup ... &` in remote_execute, and for anything that must outlive remote_execute's timeout_ms max (%ds) or this server itself (daemons, hours-long jobs): the job runs in its own session, stdout+stderr go to a server-managed log file, and the job_id works with remote_job_status, remote_job_logs (with follow), remote_job_kill and remote_wait_for(condition=process_exit, target=job_id).", cfg.MaxTimeout)),
@@ -145,7 +144,7 @@ func registerJobTools(s *server.MCPServer, jobs *JobManager, cfg *Config) {
 
 // registerWaitTool adds remote_wait_for, backed by server-side watchers
 // (waits.go) so a wait is not bounded by the client's request timeout.
-func registerWaitTool(s *server.MCPServer, executor *Executor, jobs *JobManager, waits *WaitManager, cfg *Config) {
+func registerWaitTool(s toolSink, executor *Executor, jobs *JobManager, waits *WaitManager, cfg *Config) {
 	if !cfg.toolEnabled("remote_wait_for") {
 		return
 	}

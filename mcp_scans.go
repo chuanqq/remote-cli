@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 // scanInstructions 根据实际启用的工具描述扫描能力，禁用的入口不出现在说明中。
@@ -165,7 +164,7 @@ func scanPendingHint(id string) string {
 	return fmt.Sprintf("只读扫描仍在运行，未因本次等待结束而停止。请用 remote_scan_result(scan_id=%q) 续取；不要重新发起扫描。", id)
 }
 
-func registerScanResultTool(s *server.MCPServer, cfg *Config, scans *ScanManager) {
+func registerScanResultTool(s toolSink, cfg *Config, scans *ScanManager) {
 	if !cfg.toolEnabled("remote_scan_result") {
 		return
 	}

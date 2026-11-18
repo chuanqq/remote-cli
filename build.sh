@@ -28,7 +28,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-BIN_NAME="remote-agent-proxy"
+BIN_NAME="agentic-remotectl"
+# 1.x compatibility copy: same bytes under the old binary name, so existing
+# deploy dirs, upgrade.sh checks and scripts keep working (design 07 §3.1).
+COMPAT_BIN_NAME="remote-agent-proxy"
 OUT_DIR="${OUT_DIR:-dist}"
 STRIP="${STRIP:-1}"
 
@@ -105,9 +108,13 @@ build_one() {
     CGO_ENABLED="${cgo}" GOOS="${os}" GOARCH="${arch}" \
         go build -ldflags="${ldflags}" -o "${out}" .
 
-    local size
+    local size compat
+    compat="${OUT_DIR}/${COMPAT_BIN_NAME}-${VERSION}-${os}-${arch}"
+    [[ "$os" == "windows" ]] && compat="${compat}.exe"
+    cp -p "${out}" "${compat}"
     size=$(du -h "${out}" | cut -f1)
     log_info "完成: ${out} (${size})"
+    log_info "兼容副本: ${compat}"
 }
 
 # 解析 "os/arch" 并构建

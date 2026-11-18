@@ -15,3 +15,5 @@
 .env
 /remote-agent-proxy.pid
 /remote-agent-proxy.log
+# Pinned protobuf code generators installed by scripts/genproto.sh.
+/.tools/

@@ -1,0 +1,188 @@
+syntax = "proto3";
+
+package control;
+
+option go_package = "github.com/chuanqq/remote-cli/internal/control/proto;controlpb";
+
+import "google/protobuf/timestamp.proto";
+
+// Control is the single master-slaver long-lived bidirectional stream. The
+// slaver dials the master and keeps the stream open; every message in both
+// directions is a Frame.
+service Control {
+  rpc Connect(stream Frame) returns (stream Frame);
+}
+
+// Frame is the shared envelope (design 03 §3). Fields are append-only:
+// published field numbers must never be reused, and new fields must be
+// optional with default values.
+message Frame {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string message_type = 3;
+  string request_id = 4;
+  string trace_id = 5;
+  string node_id = 6;
+  string instance_id = 7;
+  uint64 connection_epoch = 8;
+  string operation_id = 9;
+  string idempotency_key = 10;
+  uint64 sequence = 11;
+  google.protobuf.Timestamp sent_at = 12;
+  google.protobuf.Timestamp deadline_at = 13;
+
+  oneof payload {
+    RegisterRequest register = 20;
+    RegisterAck register_ack = 21;
+    RegisterReject register_reject = 22;
+    Heartbeat heartbeat = 23;
+    HeartbeatAck heartbeat_ack = 24;
+    Invoke invoke = 25;
+    Accepted accepted = 26;
+    Progress progress = 27;
+    Result result = 28;
+    Query query = 29;
+    QueryResult query_result = 30;
+    Cancel cancel = 31;
+    CancelAck cancel_ack = 32;
+    Close close = 33;
+    ErrorMessage error = 34;
+  }
+}
+
+message RegisterRequest {
+  // Cluster-wide pre-shared token. The master stores only its salted hash.
+  string cluster_token = 1;
+  string software_version = 2;
+  Capabilities capabilities = 3;
+  map<string, string> labels = 4;
+  string hostname = 5;
+  string platform = 6;
+  string node_name = 7;
+}
+
+message RegisterAck {
+  uint64 connection_epoch = 1;
+  uint32 heartbeat_interval_sec = 2;
+  uint32 lease_ttl_sec = 3;
+  string master_version = 4;
+  string policy_revision = 5;
+  // pending when manual approval is required; ready when routable.
+  string status = 6;
+}
+
+message RegisterReject {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message Heartbeat {
+  uint64 sequence = 1;
+  Load load = 2;
+}
+
+message HeartbeatAck {
+  uint64 sequence = 1;
+}
+
+message Load {
+  uint32 running_executions = 1;
+  uint32 active_scans = 2;
+  uint32 running_jobs = 3;
+}
+
+message Capabilities {
+  repeated string operations = 1;
+  bool readonly = 2;
+  Limits limits = 3;
+  repeated string fs_roots = 4;
+  string deny_commands = 5;
+  uint64 capability_revision = 6;
+}
+
+message Limits {
+  int32 max_timeout_sec = 1;
+  int64 max_output = 2;
+  int32 call_budget_sec = 3;
+  int32 max_active_scans = 4;
+  int32 max_active_waits = 5;
+}
+
+message Invoke {
+  string tool = 1;
+  // Canonical JSON object with the tool arguments.
+  string arguments_json = 2;
+  string principal_id = 3;
+  // Master call budget. The slaver uses min(this, its own budget).
+  int32 call_budget_ms = 4;
+}
+
+message Accepted {
+  string operation_id = 1;
+  // Slaver-side handle for the task (execution_id, scan_id, ... when known).
+  string local_task_id = 2;
+  string task_kind = 3;
+  uint32 queue_position = 4;
+  google.protobuf.Timestamp accepted_at = 5;
+}
+
+message Progress {
+  string operation_id = 1;
+  uint64 sequence = 2;
+  int64 elapsed_ms = 3;
+  string state = 4;
+  string detail = 5;
+}
+
+message Result {
+  string operation_id = 1;
+  uint64 sequence = 2;
+  // completed | timed_out | cancelled | not_started | failed
+  string state = 3;
+  int32 exit_code = 4;
+  // Opaque tool result: JSON when is_json, otherwise plain text.
+  string result_text = 5;
+  bool is_json = 6;
+  bool is_error = 7;
+  string error_code = 8;
+  string error_message = 9;
+  google.protobuf.Timestamp finished_at = 10;
+}
+
+message Query {
+  string operation_id = 1;
+  uint64 last_sequence = 2;
+}
+
+message QueryResult {
+  string operation_id = 1;
+  string state = 2;
+  uint64 sequence = 3;
+  Result result = 4;
+}
+
+message Cancel {
+  string operation_id = 1;
+  string reason = 2;
+}
+
+message CancelAck {
+  string operation_id = 1;
+  string state = 2;
+}
+
+message Close {
+  string reason = 1;
+}
+
+message ErrorMessage {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  int64 retry_after_ms = 4;
+  string request_id = 5;
+  string trace_id = 6;
+  string operation_id = 7;
+  string node_id = 8;
+}

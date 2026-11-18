@@ -4,6 +4,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,7 +28,18 @@ type Session struct {
 	mu               sync.RWMutex
 	workingDirectory string
 	expiresAt        time.Time
+
+	// executing enforces D18: one remote_session_execute at a time per
+	// session, so `cd` ordering is deterministic. It is held until the
+	// command finishes, including detached executions that outlive the call.
+	executing atomic.Bool
 }
+
+// tryLockExec reserves the session's execution slot.
+func (s *Session) tryLockExec() bool { return s.executing.CompareAndSwap(false, true) }
+
+// unlockExec releases the execution slot.
+func (s *Session) unlockExec() { s.executing.Store(false) }
 
 // Expiry returns when the session expires unless it is used again.
 func (s *Session) Expiry() time.Time {

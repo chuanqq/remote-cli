@@ -65,6 +65,9 @@ type Execution struct {
 	onLate        func(*ExecResult) // reports the outcome of a handed-off execution
 }
 
+// Done is closed when the command has finished (its result is available).
+func (e *Execution) Done() <-chan struct{} { return e.done }
+
 // ExecutionInfo is the JSON view of an execution without its output.
 type ExecutionInfo struct {
 	ExecutionID      string `json:"execution_id"`

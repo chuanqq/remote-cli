@@ -53,6 +53,21 @@ func (a *AuditLogger) Log(entry AuditEntry) {
 	if entry.Client != "" {
 		attrs = append(attrs, slog.String("client", entry.Client))
 	}
+	if entry.PrincipalID != "" {
+		attrs = append(attrs, slog.String("principal_id", entry.PrincipalID))
+	}
+	if entry.TargetNodeID != "" {
+		attrs = append(attrs, slog.String("target_node_id", entry.TargetNodeID))
+	}
+	if entry.OperationID != "" {
+		attrs = append(attrs, slog.String("operation_id", entry.OperationID))
+	}
+	if entry.TraceID != "" {
+		attrs = append(attrs, slog.String("trace_id", entry.TraceID))
+	}
+	if entry.Route != "" {
+		attrs = append(attrs, slog.String("route", entry.Route))
+	}
 	if entry.Error != "" {
 		attrs = append(attrs, slog.String("error", RedactCommand(entry.Error)))
 	}
